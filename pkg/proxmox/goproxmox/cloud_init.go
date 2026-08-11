@@ -499,11 +499,17 @@ func requireCloudInitUploadQuiescence(ctx context.Context, node *proxmox.Node) e
 }
 
 func validateCloudInitTargetDevice(vm *proxmox.VirtualMachine, machineIdentity, device string) error {
+	if device != cloudInitDevice {
+		return fmt.Errorf("cloud-init target device %q is not supported", device)
+	}
 	deviceValue := cloudInitDeviceValue(vm, device)
 	if deviceValue == "" || deviceValue == cloudInitUnmountedDeviceValue {
 		return nil
 	}
-	if _, _, err := ownedCloudInitVolume(deviceValue, machineIdentity); err != nil {
+	if _, _, err := ownedCloudInitVolume(deviceValue, machineIdentity); err == nil {
+		return nil
+	}
+	if err := validatePVECloudInitPlaceholder(deviceValue, vm.VMID); err != nil {
 		return fmt.Errorf("cloud-init target device %q is occupied by foreign state: %w", device, err)
 	}
 	return nil
@@ -868,6 +874,9 @@ func cloudInitMountIsExact(vm *proxmox.VirtualMachine, machineIdentity, device, 
 	}
 	_, mountedVolID, err := ownedCloudInitVolume(deviceValue, machineIdentity)
 	if err != nil {
+		if placeholderErr := validatePVECloudInitPlaceholder(deviceValue, vm.VMID); placeholderErr == nil {
+			return false, nil
+		}
 		return false, err
 	}
 	if mountedVolID != expectedVolID {
@@ -895,34 +904,60 @@ func parseCloudInitISOMount(deviceValue string) (storageName, volID, name string
 	if len(parts) < 2 {
 		return "", "", "", fmt.Errorf("cloud-init device is not an exact ISO mount")
 	}
-	seenMedia := false
-	seenSize := false
-	for _, option := range parts[1:] {
-		switch {
-		case option == "media=cdrom":
-			if seenMedia {
-				return "", "", "", fmt.Errorf("cloud-init device has duplicate media option")
-			}
-			seenMedia = true
-		case strings.HasPrefix(option, "media="):
-			return "", "", "", fmt.Errorf("cloud-init device has conflicting media option")
-		case strings.HasPrefix(option, "size="):
-			if seenSize || !isNormalizedPVESize(strings.TrimPrefix(option, "size=")) {
-				return "", "", "", fmt.Errorf("cloud-init device has invalid normalized size option")
-			}
-			seenSize = true
-		default:
-			return "", "", "", fmt.Errorf("cloud-init device has unsupported normalized option %q", option)
-		}
-	}
-	if !seenMedia {
-		return "", "", "", fmt.Errorf("cloud-init device is missing media=cdrom")
+	if err := validateCloudInitMountOptions(parts[1:]); err != nil {
+		return "", "", "", err
 	}
 	storageAndName := strings.Split(parts[0], ":iso/")
 	if len(storageAndName) != 2 || !isSafePVEStorageName(storageAndName[0]) {
 		return "", "", "", fmt.Errorf("cloud-init device has invalid storage volume identity")
 	}
 	return storageAndName[0], parts[0], storageAndName[1], nil
+}
+
+func validatePVECloudInitPlaceholder(deviceValue string, vmID proxmox.StringOrUint64) error {
+	parts := strings.Split(deviceValue, ",")
+	if len(parts) < 2 {
+		return fmt.Errorf("cloud-init placeholder is not an exact CD-ROM mount")
+	}
+	if err := validateCloudInitMountOptions(parts[1:]); err != nil {
+		return err
+	}
+	storageAndName := strings.Split(parts[0], ":")
+	if len(storageAndName) != 2 || !isSafePVEStorageName(storageAndName[0]) {
+		return fmt.Errorf("cloud-init placeholder has invalid storage volume identity")
+	}
+	expectedName := fmt.Sprintf("vm-%d-cloudinit", vmID)
+	if storageAndName[1] != expectedName {
+		return fmt.Errorf("cloud-init placeholder is not the exact same-VM artifact %q", expectedName)
+	}
+	return nil
+}
+
+func validateCloudInitMountOptions(options []string) error {
+	seenMedia := false
+	seenSize := false
+	for _, option := range options {
+		switch {
+		case option == "media=cdrom":
+			if seenMedia {
+				return fmt.Errorf("cloud-init device has duplicate media option")
+			}
+			seenMedia = true
+		case strings.HasPrefix(option, "media="):
+			return fmt.Errorf("cloud-init device has conflicting media option")
+		case strings.HasPrefix(option, "size="):
+			if seenSize || !isNormalizedPVESize(strings.TrimPrefix(option, "size=")) {
+				return fmt.Errorf("cloud-init device has invalid normalized size option")
+			}
+			seenSize = true
+		default:
+			return fmt.Errorf("cloud-init device has unsupported normalized option %q", option)
+		}
+	}
+	if !seenMedia {
+		return fmt.Errorf("cloud-init device is missing media=cdrom")
+	}
+	return nil
 }
 
 func ownedCloudInitVolume(deviceValue, machineIdentity string) (storageName, volID string, err error) {
