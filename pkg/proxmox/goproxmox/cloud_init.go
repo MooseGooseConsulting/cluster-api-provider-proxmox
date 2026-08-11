@@ -631,24 +631,27 @@ func (c *APIClient) reconcileSupersededCloudInitArtifact(ctx context.Context, vm
 	if deviceValue != "" && deviceValue != cloudInitUnmountedDeviceValue {
 		_, mountedVolID, err := ownedCloudInitVolume(deviceValue, machineIdentity)
 		if err != nil {
-			return fmt.Errorf("cannot reconcile superseded cloud-init artifact while target device is foreign: %w", err)
-		}
-		switch mountedVolID {
-		case supersededVolID:
-			if err := c.UnmountCloudInitISO(ctx, vm, machineIdentity, device); err != nil {
-				return fmt.Errorf("unmount superseded cloud-init artifact %q: %w", supersededVolID, err)
+			if placeholderErr := validatePVECloudInitPlaceholder(deviceValue, vm.VMID); placeholderErr != nil {
+				return fmt.Errorf("cannot reconcile superseded cloud-init artifact while target device is foreign: %w", err)
 			}
-			if err := vm.Ping(ctx); err != nil {
-				return fmt.Errorf("refetch VM after superseded cloud-init cleanup: %w", err)
+		} else {
+			switch mountedVolID {
+			case supersededVolID:
+				if err := c.UnmountCloudInitISO(ctx, vm, machineIdentity, device); err != nil {
+					return fmt.Errorf("unmount superseded cloud-init artifact %q: %w", supersededVolID, err)
+				}
+				if err := vm.Ping(ctx); err != nil {
+					return fmt.Errorf("refetch VM after superseded cloud-init cleanup: %w", err)
+				}
+				if err := addCloudInitOwnershipTag(ctx, vm); err != nil {
+					return fmt.Errorf("restore cloud-init ownership tag after superseded cleanup: %w", err)
+				}
+				return nil
+			case expectedVolID:
+				// The superseded artifact is unattached; delete it below.
+			default:
+				return fmt.Errorf("cloud-init device mounts %q while reconciling superseded volume %q", mountedVolID, supersededVolID)
 			}
-			if err := addCloudInitOwnershipTag(ctx, vm); err != nil {
-				return fmt.Errorf("restore cloud-init ownership tag after superseded cleanup: %w", err)
-			}
-			return nil
-		case expectedVolID:
-			// The superseded artifact is unattached; delete it below.
-		default:
-			return fmt.Errorf("cloud-init device mounts %q while reconciling superseded volume %q", mountedVolID, supersededVolID)
 		}
 	}
 	if _, err := deleteOwnedCloudInitVolume(ctx, storage, supersededVolID); err != nil {
