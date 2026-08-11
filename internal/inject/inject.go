@@ -35,6 +35,9 @@ const CloudInitISODevice = "ide0"
 // ISOInjector used to Inject cloudinit userdata, metadata and network-config into a Proxmox VirtualMachine.
 type ISOInjector struct {
 	VirtualMachine *proxmox.VirtualMachine
+	ProxmoxClient  interface {
+		CloudInit(ctx context.Context, vm *proxmox.VirtualMachine, device, userdata, metadata, vendordata, networkconfig string) error
+	}
 
 	BootstrapData []byte
 
@@ -74,7 +77,7 @@ func (i *ISOInjector) injectCloudInit(ctx context.Context) error {
 	logger.V(4).Info("CloudInit:", "network-config", string(network))
 
 	// Inject an ISO with userdata, metadata and network-config into the VirtualMachine.
-	err = i.VirtualMachine.CloudInit(ctx, CloudInitISODevice, string(i.BootstrapData), string(metadata), "", string(network))
+	err = i.ProxmoxClient.CloudInit(ctx, i.VirtualMachine, CloudInitISODevice, string(i.BootstrapData), string(metadata), "", string(network))
 	if err != nil {
 		return errors.Wrap(err, "unable to inject CloudInit ISO")
 	}

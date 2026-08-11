@@ -39,6 +39,7 @@ import (
 	"github.com/ionos-cloud/cluster-api-provider-proxmox/pkg/cloudinit"
 	"github.com/ionos-cloud/cluster-api-provider-proxmox/pkg/ignition"
 	"github.com/ionos-cloud/cluster-api-provider-proxmox/pkg/network"
+	capmox "github.com/ionos-cloud/cluster-api-provider-proxmox/pkg/proxmox"
 	"github.com/ionos-cloud/cluster-api-provider-proxmox/pkg/scope"
 )
 
@@ -122,7 +123,7 @@ func injectCloudInit(ctx context.Context, machineScope *scope.MachineScope, boot
 	// create metadata renderer
 	metadata := cloudinit.NewMetadata(biosUUID, machineScope.Name(), kubernetesVersion, *ptr.Deref(machineScope.ProxmoxMachine.Spec.MetadataSettings, infrav1.MetadataSettings{ProviderIDInjection: new(false)}).ProviderIDInjection)
 
-	injector := getISOInjector(machineScope.VirtualMachine, bootstrapData, metadata, network)
+	injector := getISOInjector(machineScope.InfraCluster.ProxmoxClient, machineScope.VirtualMachine, bootstrapData, metadata, network)
 	return injector.Inject(ctx, inject.CloudConfigFormat)
 }
 
@@ -147,9 +148,10 @@ type isoInjector interface {
 	Inject(ctx context.Context, format inject.BootstrapDataFormat) error
 }
 
-func defaultISOInjector(vm *proxmox.VirtualMachine, bootStrapData []byte, metadata, network cloudinit.Renderer) isoInjector {
+func defaultISOInjector(client capmox.Client, vm *proxmox.VirtualMachine, bootStrapData []byte, metadata, network cloudinit.Renderer) isoInjector {
 	return &inject.ISOInjector{
 		VirtualMachine:  vm,
+		ProxmoxClient:   client,
 		BootstrapData:   bootStrapData,
 		MetaRenderer:    metadata,
 		NetworkRenderer: network,

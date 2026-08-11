@@ -108,6 +108,7 @@ func TestISOInjectorInjectCloudInit(t *testing.T) {
 
 	injector := &ISOInjector{
 		VirtualMachine: vm,
+		ProxmoxClient:  client,
 		BootstrapData:  []byte(""),
 		MetaRenderer:   cloudinit.NewMetadata("xxx-xxxx", "my-custom-vm", "1.2.3", true),
 		NetworkRenderer: cloudinit.NewNetworkConfig([]network.ConfigData{
