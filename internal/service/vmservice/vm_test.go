@@ -534,6 +534,8 @@ func TestReconcileDisks_ResizeDisk(t *testing.T) {
 
 func TestReconcileMachineAddresses_IPv4(t *testing.T) {
 	machineScope, _, _ := setupReconcilerTestWithCondition(t, infrav1.ProxmoxMachineVirtualMachineProvisionedWaitingForClusterAPIMachineAddressesReason)
+	machineScope.Machine.Name = "capi-machine-name"
+	machineScope.ProxmoxMachine.Name = "proxmox-machine-name"
 	vm := newRunningVM()
 	machineScope.SetVirtualMachine(vm)
 	machineScope.SetVirtualMachineID(int64(vm.VMID))
@@ -547,8 +549,12 @@ func TestReconcileMachineAddresses_IPv4(t *testing.T) {
 	machineScope.ProxmoxMachine.Status.BootstrapDataProvided = new(true)
 
 	require.NoError(t, reconcileMachineAddresses(machineScope))
-	require.Equal(t, machineScope.ProxmoxMachine.Status.Addresses[0].Address, machineScope.ProxmoxMachine.GetName())
-	require.Equal(t, machineScope.ProxmoxMachine.Status.Addresses[1].Address, "10.10.10.10")
+	require.Equal(t, []clusterv1.MachineAddress{
+		{Type: clusterv1.MachineInternalIP, Address: "10.10.10.10"},
+	}, machineScope.ProxmoxMachine.Status.Addresses)
+	for _, address := range machineScope.ProxmoxMachine.Status.Addresses {
+		require.NotEqual(t, clusterv1.MachineHostName, address.Type)
+	}
 }
 
 func TestReconcileMachineAddresses_IPv6(t *testing.T) {
@@ -573,8 +579,9 @@ func TestReconcileMachineAddresses_IPv6(t *testing.T) {
 	machineScope.ProxmoxMachine.Status.BootstrapDataProvided = new(true)
 
 	require.NoError(t, reconcileMachineAddresses(machineScope))
-	require.Equal(t, machineScope.ProxmoxMachine.Status.Addresses[0].Address, machineScope.ProxmoxMachine.GetName())
-	require.Equal(t, machineScope.ProxmoxMachine.Status.Addresses[1].Address, "2001:db8::2")
+	require.Equal(t, []clusterv1.MachineAddress{
+		{Type: clusterv1.MachineInternalIP, Address: "2001:db8::2"},
+	}, machineScope.ProxmoxMachine.Status.Addresses)
 }
 
 func TestReconcileMachineAddresses_DualStack(t *testing.T) {
@@ -600,9 +607,10 @@ func TestReconcileMachineAddresses_DualStack(t *testing.T) {
 	machineScope.ProxmoxMachine.Status.BootstrapDataProvided = new(true)
 
 	require.NoError(t, reconcileMachineAddresses(machineScope))
-	require.Equal(t, machineScope.ProxmoxMachine.Status.Addresses[0].Address, machineScope.ProxmoxMachine.GetName())
-	require.Equal(t, machineScope.ProxmoxMachine.Status.Addresses[1].Address, "10.10.10.10")
-	require.Equal(t, machineScope.ProxmoxMachine.Status.Addresses[2].Address, "2001:db8::2")
+	require.Equal(t, []clusterv1.MachineAddress{
+		{Type: clusterv1.MachineInternalIP, Address: "10.10.10.10"},
+		{Type: clusterv1.MachineInternalIP, Address: "2001:db8::2"},
+	}, machineScope.ProxmoxMachine.Status.Addresses)
 }
 
 func TestReconcileVirtualMachineConfigVLAN(t *testing.T) {
@@ -907,7 +915,8 @@ func TestReconcileVM_StateMachine(t *testing.T) {
 	require.NoError(t, err)
 
 	// Test that reconcileMachineAddresses ran.
-	require.Equal(t, machineScope.ProxmoxMachine.GetName(), machineScope.ProxmoxMachine.Status.Addresses[0].Address)
-	require.Equal(t, "192.0.2.10", machineScope.ProxmoxMachine.Status.Addresses[1].Address)
-	require.Equal(t, "2001:db8::2", machineScope.ProxmoxMachine.Status.Addresses[2].Address)
+	require.Equal(t, []clusterv1.MachineAddress{
+		{Type: clusterv1.MachineInternalIP, Address: "192.0.2.10"},
+		{Type: clusterv1.MachineInternalIP, Address: "2001:db8::2"},
+	}, machineScope.ProxmoxMachine.Status.Addresses)
 }
