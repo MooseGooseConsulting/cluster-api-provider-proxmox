@@ -50,6 +50,14 @@ type fakeCloudInitStorage struct {
 	storageFilename string
 	checksum        string
 	algorithm       string
+	deletedVolume   string
+	deleteCalls     int
+}
+
+func (s *fakeCloudInitStorage) DeleteContent(_ context.Context, content string) (*proxmox.Task, error) {
+	s.deleteCalls++
+	s.deletedVolume = content
+	return nil, nil
 }
 
 func (s *fakeCloudInitStorage) UploadWithHash(content, _ string, storageFilename *string, checksum, checksumAlgorithm string) (*proxmox.Task, error) {
@@ -209,7 +217,94 @@ func TestUploadCloudInitISOProof(t *testing.T) {
 func TestAppendBootDevice(t *testing.T) {
 	require.Equal(t, "order=scsi0;net0;ide0", appendBootDevice("order=scsi0;net0", "ide0"))
 	require.Equal(t, "order=scsi0;ide0", appendBootDevice("order=scsi0;ide0", "ide0"))
-	require.Equal(t, "order=ide0", appendBootDevice("", "ide0"))
+	require.Empty(t, appendBootDevice("", "ide0"), "unset/default boot order must remain unset")
+}
+
+func TestCloudInitConfigOptionsPreservesDefaultBoot(t *testing.T) {
+	vm := &proxmox.VirtualMachine{VirtualMachineConfig: &proxmox.VirtualMachineConfig{}}
+	options := cloudInitConfigOptions(vm, "ide0", "local:iso/owned.iso")
+	require.Equal(t, []proxmox.VirtualMachineOption{{Name: "ide0", Value: "local:iso/owned.iso,media=cdrom"}}, options)
+}
+
+func TestOwnedCloudInitVolume(t *testing.T) {
+	digest := strings.Repeat("a", cloudInitDigestLength)
+	owned := "local:iso/user-data-machine-a-" + digest + ".iso,media=cdrom"
+	storageName, volID, err := ownedCloudInitVolume(owned, "machine-a")
+	require.NoError(t, err)
+	require.Equal(t, "local", storageName)
+	require.Equal(t, strings.TrimSuffix(owned, ",media=cdrom"), volID)
+
+	for _, foreign := range []string{
+		"local:iso/user-data-machine-b-" + digest + ".iso,media=cdrom",
+		"local:iso/user-data-machine-a-short.iso,media=cdrom",
+		"local:iso/user-data-machine-a-" + digest + ".iso,media=disk",
+		"../local:iso/user-data-machine-a-" + digest + ".iso,media=cdrom",
+	} {
+		_, _, err := ownedCloudInitVolume(foreign, "machine-a")
+		require.Error(t, err)
+	}
+}
+
+func TestInspectOwnedCloudInitVolume(t *testing.T) {
+	volID := "local:iso/user-data-machine-a-" + strings.Repeat("a", cloudInitDigestLength) + ".iso"
+	tests := []struct {
+		name      string
+		contents  []*proxmox.StorageContent
+		wantFound bool
+		wantError string
+	}{
+		{name: "exact", contents: []*proxmox.StorageContent{{Volid: volID, Format: "iso"}}, wantFound: true},
+		{name: "replay absent", contents: []*proxmox.StorageContent{{Volid: "local:iso/foreign.iso", Format: "iso"}}},
+		{name: "format mismatch", contents: []*proxmox.StorageContent{{Volid: volID, Format: "raw"}}, wantError: "unexpected format"},
+		{name: "duplicate", contents: []*proxmox.StorageContent{{Volid: volID, Format: "iso"}, {Volid: volID, Format: "iso"}}, wantError: "duplicate exact"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			storage := &fakeCloudInitStorage{results: []storageResult{{contents: test.contents}}}
+			found, err := inspectOwnedCloudInitVolume(context.Background(), storage, volID)
+			if test.wantError == "" {
+				require.NoError(t, err)
+			} else {
+				require.ErrorContains(t, err, test.wantError)
+			}
+			require.Equal(t, test.wantFound, found)
+			require.Zero(t, storage.deleteCalls, "inspection must never perform broad or implicit deletion")
+		})
+	}
+}
+
+func TestDeleteOwnedCloudInitVolume(t *testing.T) {
+	volID := "local:iso/user-data-machine-a-" + strings.Repeat("a", cloudInitDigestLength) + ".iso"
+	tests := []struct {
+		name        string
+		contents    []*proxmox.StorageContent
+		wantDeleted bool
+		wantError   string
+	}{
+		{name: "exact", contents: []*proxmox.StorageContent{{Volid: volID, Format: "iso"}}, wantDeleted: true},
+		{name: "replay absent", contents: []*proxmox.StorageContent{}},
+		{name: "foreign only", contents: []*proxmox.StorageContent{{Volid: "local:iso/foreign.iso", Format: "iso"}}},
+		{name: "format mismatch", contents: []*proxmox.StorageContent{{Volid: volID, Format: "raw"}}, wantError: "unexpected format"},
+		{name: "duplicate", contents: []*proxmox.StorageContent{{Volid: volID, Format: "iso"}, {Volid: volID, Format: "iso"}}, wantError: "duplicate exact"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			storage := &fakeCloudInitStorage{results: []storageResult{{contents: test.contents}}}
+			_, deleted, err := deleteOwnedCloudInitVolume(context.Background(), storage, volID)
+			if test.wantError == "" {
+				require.NoError(t, err)
+			} else {
+				require.ErrorContains(t, err, test.wantError)
+			}
+			require.Equal(t, test.wantDeleted, deleted)
+			if test.wantDeleted {
+				require.Equal(t, 1, storage.deleteCalls)
+				require.Equal(t, volID, storage.deletedVolume)
+			} else {
+				require.Zero(t, storage.deleteCalls, "foreign, absent, and mismatched volumes must never be deleted")
+			}
+		})
+	}
 }
 
 func TestMakeCloudInitISOErrorRemovesTemporaryFile(t *testing.T) {

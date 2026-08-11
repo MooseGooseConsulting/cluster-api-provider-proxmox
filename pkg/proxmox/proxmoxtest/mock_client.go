@@ -970,17 +970,17 @@ func (_c *MockClient_TagVM_Call) RunAndReturn(run func(context.Context, *go_prox
 	return _c
 }
 
-// UnmountCloudInitISO provides a mock function with given fields: ctx, vm, device
-func (_m *MockClient) UnmountCloudInitISO(ctx context.Context, vm *go_proxmox.VirtualMachine, device string) error {
-	ret := _m.Called(ctx, vm, device)
+// UnmountCloudInitISO provides a mock function with given fields: ctx, vm, machineIdentity, device
+func (_m *MockClient) UnmountCloudInitISO(ctx context.Context, vm *go_proxmox.VirtualMachine, machineIdentity string, device string) error {
+	ret := _m.Called(ctx, vm, machineIdentity, device)
 
 	if len(ret) == 0 {
 		panic("no return value specified for UnmountCloudInitISO")
 	}
 
 	var r0 error
-	if rf, ok := ret.Get(0).(func(context.Context, *go_proxmox.VirtualMachine, string) error); ok {
-		r0 = rf(ctx, vm, device)
+	if rf, ok := ret.Get(0).(func(context.Context, *go_proxmox.VirtualMachine, string, string) error); ok {
+		r0 = rf(ctx, vm, machineIdentity, device)
 	} else {
 		r0 = ret.Error(0)
 	}
@@ -996,14 +996,15 @@ type MockClient_UnmountCloudInitISO_Call struct {
 // UnmountCloudInitISO is a helper method to define mock.On call
 //   - ctx context.Context
 //   - vm *go_proxmox.VirtualMachine
+//   - machineIdentity string
 //   - device string
-func (_e *MockClient_Expecter) UnmountCloudInitISO(ctx interface{}, vm interface{}, device interface{}) *MockClient_UnmountCloudInitISO_Call {
-	return &MockClient_UnmountCloudInitISO_Call{Call: _e.mock.On("UnmountCloudInitISO", ctx, vm, device)}
+func (_e *MockClient_Expecter) UnmountCloudInitISO(ctx interface{}, vm interface{}, machineIdentity interface{}, device interface{}) *MockClient_UnmountCloudInitISO_Call {
+	return &MockClient_UnmountCloudInitISO_Call{Call: _e.mock.On("UnmountCloudInitISO", ctx, vm, machineIdentity, device)}
 }
 
-func (_c *MockClient_UnmountCloudInitISO_Call) Run(run func(ctx context.Context, vm *go_proxmox.VirtualMachine, device string)) *MockClient_UnmountCloudInitISO_Call {
+func (_c *MockClient_UnmountCloudInitISO_Call) Run(run func(ctx context.Context, vm *go_proxmox.VirtualMachine, machineIdentity string, device string)) *MockClient_UnmountCloudInitISO_Call {
 	_c.Call.Run(func(args mock.Arguments) {
-		run(args[0].(context.Context), args[1].(*go_proxmox.VirtualMachine), args[2].(string))
+		run(args[0].(context.Context), args[1].(*go_proxmox.VirtualMachine), args[2].(string), args[3].(string))
 	})
 	return _c
 }
@@ -1013,7 +1014,7 @@ func (_c *MockClient_UnmountCloudInitISO_Call) Return(_a0 error) *MockClient_Unm
 	return _c
 }
 
-func (_c *MockClient_UnmountCloudInitISO_Call) RunAndReturn(run func(context.Context, *go_proxmox.VirtualMachine, string) error) *MockClient_UnmountCloudInitISO_Call {
+func (_c *MockClient_UnmountCloudInitISO_Call) RunAndReturn(run func(context.Context, *go_proxmox.VirtualMachine, string, string) error) *MockClient_UnmountCloudInitISO_Call {
 	_c.Call.Return(run)
 	return _c
 }

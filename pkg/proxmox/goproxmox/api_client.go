@@ -344,17 +344,59 @@ func (c *APIClient) TagVM(ctx context.Context, vm *proxmox.VirtualMachine, tag s
 	return vm.AddTag(ctx, tag)
 }
 
-// UnmountCloudInitISO unmounts the cloud-init iso from VM.
-func (c *APIClient) UnmountCloudInitISO(ctx context.Context, vm *proxmox.VirtualMachine, device string) error {
-	err := vm.UnmountCloudInitISO(ctx, device)
+// UnmountCloudInitISO unmounts the cloud-init ISO and deletes only the exact
+// content-addressed volume mounted for the immutable ProxmoxMachine identity.
+func (c *APIClient) UnmountCloudInitISO(ctx context.Context, vm *proxmox.VirtualMachine, machineIdentity, device string) error {
+	if !vm.HasTag(proxmox.MakeTag(proxmox.TagCloudInit)) {
+		return nil
+	}
+	if vm.VirtualMachineConfig == nil || device != "ide0" {
+		return fmt.Errorf("unable to prove mounted cloud-init device %q", device)
+	}
+	storageName, volID, err := ownedCloudInitVolume(vm.VirtualMachineConfig.IDE0, machineIdentity)
+	if err != nil {
+		return err
+	}
+	node, err := c.Node(ctx, vm.Node)
+	if err != nil {
+		return fmt.Errorf("get cloud-init node: %w", err)
+	}
+	storage, err := node.Storage(ctx, storageName)
+	if err != nil {
+		return fmt.Errorf("get cloud-init storage %q: %w", storageName, err)
+	}
+	present, err := inspectOwnedCloudInitVolume(ctx, storage, volID)
+	if err != nil {
+		return fmt.Errorf("inspect mounted cloud-init volume: %w", err)
+	}
+
+	unmountTask, err := vm.Config(ctx, proxmox.VirtualMachineOption{Name: device, Value: "none,media=cdrom"})
 	if err != nil {
 		return fmt.Errorf("unable to unmount cloud-init iso: %w", err)
 	}
-
-	if vm.HasTag(proxmox.MakeTag(proxmox.TagCloudInit)) {
-		_, err = vm.RemoveTag(ctx, proxmox.MakeTag(proxmox.TagCloudInit))
+	if err := unmountTask.WaitFor(ctx, 2); err != nil {
+		return fmt.Errorf("wait for cloud-init unmount: %w", err)
 	}
-	return err
+	if present {
+		deleteTask, deleted, err := deleteOwnedCloudInitVolume(ctx, storage, volID)
+		if err != nil {
+			return fmt.Errorf("delete exact cloud-init volume %q: %w", volID, err)
+		}
+		if deleted && deleteTask != nil {
+			if err := deleteTask.WaitFor(ctx, 2); err != nil {
+				return fmt.Errorf("wait for exact cloud-init volume deletion: %w", err)
+			}
+		}
+	}
+
+	removeTagTask, err := vm.RemoveTag(ctx, proxmox.MakeTag(proxmox.TagCloudInit))
+	if err != nil && !proxmox.IsErrNoop(err) {
+		return err
+	}
+	if err == nil {
+		return removeTagTask.WaitFor(ctx, 2)
+	}
+	return nil
 }
 
 // CloudInitStatus returns the cloud-init status of the VM.

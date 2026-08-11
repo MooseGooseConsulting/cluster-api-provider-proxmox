@@ -682,7 +682,7 @@ func TestReconcileDisks_UnmountCloudInitISO(t *testing.T) {
 	vm.VirtualMachineConfig.IDE0 = "local:iso/cloud-init.iso,media=cdrom"
 	machineScope.SetVirtualMachine(vm)
 
-	proxmoxClient.EXPECT().UnmountCloudInitISO(context.Background(), vm, "ide0").Return(nil)
+	proxmoxClient.EXPECT().UnmountCloudInitISO(context.Background(), vm, string(machineScope.ProxmoxMachine.UID), "ide0").Return(nil)
 
 	require.NoError(t, unmountCloudInitISO(context.Background(), machineScope))
 }
@@ -909,7 +909,7 @@ func TestReconcileVM_StateMachine(t *testing.T) {
 	machineScope.Machine.Status.NodeRef = clusterv1.MachineNodeReference{Name: "node2"}
 
 	proxmoxClient.EXPECT().GetVM(context.Background(), "node2", int64(123)).Return(vm, nil).Once()
-	proxmoxClient.EXPECT().UnmountCloudInitISO(context.Background(), vm, "ide0").Return(nil).Once()
+	proxmoxClient.EXPECT().UnmountCloudInitISO(context.Background(), vm, string(machineScope.ProxmoxMachine.UID), "ide0").Return(nil).Once()
 
 	result, err = ReconcileVM(context.Background(), machineScope)
 	require.NoError(t, err)

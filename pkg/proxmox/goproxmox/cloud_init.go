@@ -43,6 +43,7 @@ const (
 type cloudInitStorage interface {
 	UploadWithHash(content, file string, storageFilename *string, checksum, checksumAlgorithm string) (*proxmox.Task, error)
 	GetContent(ctx context.Context) ([]*proxmox.StorageContent, error)
+	DeleteContent(ctx context.Context, content string) (*proxmox.Task, error)
 }
 
 // CloudInit uploads and mounts a cloud-init ISO. The storage filename binds
@@ -92,11 +93,8 @@ func (c *APIClient) CloudInit(ctx context.Context, vm *proxmox.VirtualMachine, m
 		return err
 	}
 
-	boot := appendBootDevice(vmBootOrder(vm), device)
-	configTask, err := vm.Config(ctx,
-		proxmox.VirtualMachineOption{Name: device, Value: fmt.Sprintf("%s:iso/%s,media=cdrom", storage.Name, isoName)},
-		proxmox.VirtualMachineOption{Name: "boot", Value: boot},
-	)
+	options := cloudInitConfigOptions(vm, device, fmt.Sprintf("%s:iso/%s", storage.Name, isoName))
+	configTask, err := vm.Config(ctx, options...)
 	if err != nil {
 		return err
 	}
@@ -205,15 +203,93 @@ func vmBootOrder(vm *proxmox.VirtualMachine) string {
 }
 
 func appendBootDevice(existing, device string) string {
+	if existing == "" {
+		return ""
+	}
 	for index, entry := range strings.Split(existing, ";") {
 		if entry == device || (index == 0 && strings.TrimPrefix(entry, "order=") == device) {
 			return existing
 		}
 	}
-	if existing == "" {
-		return "order=" + device
-	}
 	return existing + ";" + device
+}
+
+func cloudInitConfigOptions(vm *proxmox.VirtualMachine, device, volID string) []proxmox.VirtualMachineOption {
+	options := []proxmox.VirtualMachineOption{{Name: device, Value: volID + ",media=cdrom"}}
+	if boot := appendBootDevice(vmBootOrder(vm), device); boot != "" {
+		options = append(options, proxmox.VirtualMachineOption{Name: "boot", Value: boot})
+	}
+	return options
+}
+
+func ownedCloudInitVolume(deviceValue, machineIdentity string) (storageName, volID string, err error) {
+	parts := strings.Split(deviceValue, ",")
+	if len(parts) != 2 || parts[1] != "media=cdrom" {
+		return "", "", fmt.Errorf("cloud-init device is not an exact ISO mount")
+	}
+	storageAndName := strings.Split(parts[0], ":iso/")
+	if len(storageAndName) != 2 || !isSafePVEStorageName(storageAndName[0]) {
+		return "", "", fmt.Errorf("cloud-init device has invalid storage volume identity")
+	}
+	prefix := cloudInitStorageFilenamePrefix + machineIdentity + "-"
+	name := storageAndName[1]
+	if !strings.HasPrefix(name, prefix) || !strings.HasSuffix(name, ".iso") {
+		return "", "", fmt.Errorf("cloud-init device is not owned by Machine %q", machineIdentity)
+	}
+	digest := strings.TrimSuffix(strings.TrimPrefix(name, prefix), ".iso")
+	expectedName, nameErr := cloudInitISOName(machineIdentity, digest)
+	if nameErr != nil || expectedName != name {
+		return "", "", fmt.Errorf("cloud-init device has invalid content-addressed filename")
+	}
+	return storageAndName[0], parts[0], nil
+}
+
+func isSafePVEStorageName(name string) bool {
+	if name == "" {
+		return false
+	}
+	for _, char := range name {
+		if (char < 'a' || char > 'z') && (char < 'A' || char > 'Z') && (char < '0' || char > '9') && char != '-' && char != '_' && char != '.' {
+			return false
+		}
+	}
+	return true
+}
+
+func inspectOwnedCloudInitVolume(ctx context.Context, storage cloudInitStorage, volID string) (bool, error) {
+	contents, err := storage.GetContent(ctx)
+	if err != nil {
+		return false, err
+	}
+	var matched *proxmox.StorageContent
+	for _, content := range contents {
+		if content.Volid != volID {
+			continue
+		}
+		if matched != nil {
+			return false, fmt.Errorf("duplicate exact cloud-init volume %q", volID)
+		}
+		matched = content
+	}
+	if matched == nil {
+		return false, nil
+	}
+	if matched.Format != "iso" {
+		return false, fmt.Errorf("cloud-init volume %q has unexpected format %q", volID, matched.Format)
+	}
+	return true, nil
+}
+
+func deleteOwnedCloudInitVolume(ctx context.Context, storage cloudInitStorage, volID string) (*proxmox.Task, bool, error) {
+	present, err := inspectOwnedCloudInitVolume(ctx, storage, volID)
+	if err != nil || !present {
+		return nil, false, err
+	}
+	task, err := storage.DeleteContent(ctx, volID)
+	if err != nil {
+		return nil, false, err
+	}
+	return task, true, nil
 }
 
 func fileSHA256(path string) (string, uint64, error) {
