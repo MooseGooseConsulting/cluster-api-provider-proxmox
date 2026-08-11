@@ -211,7 +211,7 @@ func (c *APIClient) CloudInit(ctx context.Context, vm *proxmox.VirtualMachine, m
 		return err
 	}
 	if err := ctx.Err(); err != nil {
-		return fmt.Errorf("cloud-init dispatch context ended after ownership validation: %w", err)
+		return fmt.Errorf("%w: cloud-init dispatch context ended after ownership validation: %w", capmox.ErrCloudInitUploadPending, err)
 	}
 	if cloudInitDispatchNow().Unix() >= uploadState.LeaseUntilUnix {
 		return fmt.Errorf("%w: cloud-init dispatch ownership lease expired before POST", capmox.ErrCloudInitUploadPending)
@@ -463,9 +463,6 @@ func findCloudInitUploadTarget(ctx context.Context, node *proxmox.Node, machineI
 		if storage.Enabled == 0 || !storageSupportsContent(storage.Content, cloudInitISOContentType) {
 			continue
 		}
-		if storage.Avail >= size && (eligible == nil || storage.Name < eligible.Name) {
-			eligible = storage
-		}
 		contents, err := storage.GetContent(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("%w: inspect relevant ISO storage %q: %v", capmox.ErrCloudInitStorageDiscoveryRetryable, storage.Name, err)
@@ -476,6 +473,9 @@ func findCloudInitUploadTarget(ctx context.Context, node *proxmox.Node, machineI
 			return nil, err
 		}
 		if !found {
+			if storage.Avail >= size && (eligible == nil || storage.Name < eligible.Name) {
+				eligible = storage
+			}
 			continue
 		}
 		if candidate != expectedVolID {
@@ -484,6 +484,18 @@ func findCloudInitUploadTarget(ctx context.Context, node *proxmox.Node, machineI
 			}
 			supersededStorage = storage
 			supersededVolID = candidate
+			for _, content := range contents {
+				if content.Volid != candidate {
+					continue
+				}
+				if content.Format != cloudInitISOContentType {
+					return nil, fmt.Errorf("superseded volume %q has unexpected format %q", candidate, content.Format)
+				}
+				if (storage.Avail >= size || content.Size >= size-storage.Avail) && (eligible == nil || storage.Name < eligible.Name) {
+					eligible = storage
+				}
+				break
+			}
 			continue
 		}
 		for _, content := range contents {

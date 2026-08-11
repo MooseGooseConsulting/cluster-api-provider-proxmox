@@ -1171,6 +1171,11 @@ func TestCloudInitRequiresCurrentOwnershipImmediatelyBeforePOST(t *testing.T) {
 				firstErr := <-results
 				secondErr := <-results
 				require.True(t, (errors.Is(firstErr, context.Canceled) && secondErr == nil) || (errors.Is(secondErr, context.Canceled) && firstErr == nil), "cancelled owner must send no request and one successor must complete: first=%v second=%v", firstErr, secondErr)
+				if errors.Is(firstErr, context.Canceled) {
+					require.ErrorIs(t, firstErr, capmox.ErrCloudInitUploadPending)
+				} else {
+					require.ErrorIs(t, secondErr, capmox.ErrCloudInitUploadPending)
+				}
 				require.Equal(t, 1, httpmock.GetCallCountInfo()["POST =~/nodes/pve/storage/local/upload$"])
 				return
 			}
@@ -1310,7 +1315,7 @@ func TestFindCloudInitUploadTargetDeletesOneSupersededMachineArtifactBeforeUploa
 	node, err := client.Node(context.Background(), "pve")
 	require.NoError(t, err)
 	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve/storage$`,
-		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": &proxmox.Storages{{Name: "local", Content: "iso", Enabled: 1, Avail: 1 << 30}}}))
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": &proxmox.Storages{{Name: "local", Content: "iso", Enabled: 1, Avail: 4096}}}))
 	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve/storage/local/status$`,
 		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": &proxmox.Storage{Name: "local", Content: "iso", Enabled: 1, Avail: 1 << 30}}))
 	oldPresent := true
