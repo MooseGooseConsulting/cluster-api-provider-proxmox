@@ -217,7 +217,7 @@ func (c *APIClient) DeleteVM(ctx context.Context, nodeName string, vmID int64, m
 	// A vmID can not be lower than 100.
 	// If the provided vmID is lower (like -1 in issue #31), just error out without calling the API.
 	if vmID < 100 {
-		return nil, fmt.Errorf("vm with id %d does not exist", vmID)
+		return nil, fmt.Errorf("%w: vm id %d is below the minimum", ErrVMIDFree, vmID)
 	}
 
 	node := (&proxmox.Node{}).New(c.Client, nodeName)

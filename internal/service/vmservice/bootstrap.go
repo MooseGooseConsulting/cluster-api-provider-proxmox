@@ -94,9 +94,9 @@ func reconcileBootstrapData(ctx context.Context, machineScope *scope.MachineScop
 		err = injectCloudInit(ctx, machineScope, bootstrapData, biosUUID, nicData, kubernetesVersion)
 	}
 	if err != nil {
-		if errors.Is(err, capmox.ErrCloudInitStorageDiscoveryRetryable) {
-			machineScope.Logger.V(2).Info("cloud-init storage discovery will be retried", "error", err.Error())
-			return true, errors.Wrap(err, "retry cloud-init storage discovery")
+		if errors.Is(err, capmox.ErrCloudInitStorageDiscoveryRetryable) || errors.Is(err, capmox.ErrCloudInitUploadPending) {
+			machineScope.Logger.V(2).Info("cloud-init reconciliation will be retried", "error", err.Error())
+			return true, errors.Wrap(err, "retry cloud-init reconciliation")
 		}
 		// Todo: test this (colliding default gateways for example)
 		conditions.Set(machineScope.ProxmoxMachine, metav1.Condition{
@@ -127,7 +127,11 @@ func injectCloudInit(ctx context.Context, machineScope *scope.MachineScope, boot
 	// create metadata renderer
 	metadata := cloudinit.NewMetadata(biosUUID, machineScope.Name(), kubernetesVersion, *ptr.Deref(machineScope.ProxmoxMachine.Spec.MetadataSettings, infrav1.MetadataSettings{ProviderIDInjection: new(false)}).ProviderIDInjection)
 
-	injector := getISOInjector(machineScope.InfraCluster.ProxmoxClient, string(machineScope.ProxmoxMachine.UID), machineScope.VirtualMachine, bootstrapData, metadata, network, cloudInitUploadRecorder(machineScope))
+	upload, err := cloudInitUploadState(machineScope)
+	if err != nil {
+		return err
+	}
+	injector := getISOInjector(machineScope.InfraCluster.ProxmoxClient, string(machineScope.ProxmoxMachine.UID), machineScope.VirtualMachine, bootstrapData, metadata, network, upload, cloudInitUploadRecorder(machineScope))
 	return injector.Inject(ctx, inject.CloudConfigFormat)
 }
 
@@ -144,7 +148,11 @@ func injectIgnition(ctx context.Context, machineScope *scope.MachineScope, boots
 		Network:       nicData,
 	}
 
-	injector := getIgnitionISOInjector(machineScope.InfraCluster.ProxmoxClient, string(machineScope.ProxmoxMachine.UID), machineScope.VirtualMachine, metadata, enricher, cloudInitUploadRecorder(machineScope))
+	upload, err := cloudInitUploadState(machineScope)
+	if err != nil {
+		return err
+	}
+	injector := getIgnitionISOInjector(machineScope.InfraCluster.ProxmoxClient, string(machineScope.ProxmoxMachine.UID), machineScope.VirtualMachine, metadata, enricher, upload, cloudInitUploadRecorder(machineScope))
 	return injector.Inject(ctx, inject.IgnitionFormat)
 }
 
@@ -152,11 +160,12 @@ type isoInjector interface {
 	Inject(ctx context.Context, format inject.BootstrapDataFormat) error
 }
 
-func defaultISOInjector(client capmox.Client, machineIdentity string, vm *proxmox.VirtualMachine, bootStrapData []byte, metadata, network cloudinit.Renderer, recorder capmox.CloudInitUploadRecorder) isoInjector {
+func defaultISOInjector(client capmox.Client, machineIdentity string, vm *proxmox.VirtualMachine, bootStrapData []byte, metadata, network cloudinit.Renderer, upload *capmox.CloudInitUpload, recorder capmox.CloudInitUploadRecorder) isoInjector {
 	return &inject.ISOInjector{
 		VirtualMachine:  vm,
 		ProxmoxClient:   client,
 		MachineIdentity: machineIdentity,
+		UploadState:     upload,
 		UploadRecorder:  recorder,
 		BootstrapData:   bootStrapData,
 		MetaRenderer:    metadata,
@@ -164,11 +173,12 @@ func defaultISOInjector(client capmox.Client, machineIdentity string, vm *proxmo
 	}
 }
 
-func defaultIgnitionISOInjector(client capmox.Client, machineIdentity string, vm *proxmox.VirtualMachine, metadata cloudinit.Renderer, enricher *ignition.Enricher, recorder capmox.CloudInitUploadRecorder) isoInjector {
+func defaultIgnitionISOInjector(client capmox.Client, machineIdentity string, vm *proxmox.VirtualMachine, metadata cloudinit.Renderer, enricher *ignition.Enricher, upload *capmox.CloudInitUpload, recorder capmox.CloudInitUploadRecorder) isoInjector {
 	return &inject.ISOInjector{
 		VirtualMachine:   vm,
 		ProxmoxClient:    client,
 		MachineIdentity:  machineIdentity,
+		UploadState:      upload,
 		UploadRecorder:   recorder,
 		IgnitionEnricher: enricher,
 		MetaRenderer:     metadata,

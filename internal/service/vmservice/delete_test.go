@@ -40,11 +40,28 @@ func TestDeleteVM_SuccessNotFound(t *testing.T) {
 		Node:    "node1",
 	}, false)
 
-	proxmoxClient.EXPECT().DeleteVM(context.TODO(), "node1", int64(123), string(machineScope.ProxmoxMachine.UID), (*capmox.CloudInitUpload)(nil)).Return(nil, errors.New("vm does not exist: some reason")).Once()
+	proxmoxClient.EXPECT().DeleteVM(context.TODO(), "node1", int64(123), string(machineScope.ProxmoxMachine.UID), (*capmox.CloudInitUpload)(nil)).Return(nil, goproxmox.ErrVMIDFree).Once()
 
 	require.NoError(t, DeleteVM(context.TODO(), machineScope))
 	require.Empty(t, machineScope.ProxmoxMachine.Finalizers)
 	require.Empty(t, machineScope.InfraCluster.ProxmoxCluster.GetNode(machineScope.Name(), false))
+}
+
+func TestDeleteVMDoesNotTreatCleanupMessageAsVMAbsence(t *testing.T) {
+	machineScope, proxmoxClient, _ := setupReconcilerTest(t)
+	vm := newRunningVM()
+	machineScope.ProxmoxMachine.Spec.VirtualMachineID = new(int64(vm.VMID))
+	machineScope.InfraCluster.ProxmoxCluster.AddNodeLocation(infrav1.NodeLocation{
+		Machine: corev1.LocalObjectReference{Name: machineScope.Name()},
+		Node:    "node1",
+	}, false)
+	cleanupErr := errors.New("recorded cloud-init storage does not exist")
+	proxmoxClient.EXPECT().DeleteVM(context.TODO(), "node1", int64(123), string(machineScope.ProxmoxMachine.UID), (*capmox.CloudInitUpload)(nil)).Return(nil, cleanupErr).Once()
+
+	err := DeleteVM(context.TODO(), machineScope)
+	require.ErrorIs(t, err, cleanupErr)
+	require.NotEmpty(t, machineScope.ProxmoxMachine.Finalizers)
+	require.NotEmpty(t, machineScope.InfraCluster.ProxmoxCluster.GetNode(machineScope.Name(), false))
 }
 
 func TestDeleteVMPreservesFinalizerUntilRecordedUploadIsReconciled(t *testing.T) {

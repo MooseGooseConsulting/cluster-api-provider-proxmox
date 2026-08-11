@@ -380,7 +380,7 @@ func TestCloudInitOwnershipTagTaskFailureBlocksContinuation(t *testing.T) {
 	t.Cleanup(func() { waitForCloudInitTask = originalWait })
 	waitForCloudInitTask = func(context.Context, *proxmox.Task, int) error { return errors.New("tag task failed") }
 
-	err = client.CloudInit(context.Background(), vm, "machine-uid", "ide0", "user-data", "meta-data", "", "network-data", func(capmox.CloudInitUpload) error { return nil })
+	err = client.CloudInit(context.Background(), vm, "machine-uid", "ide0", "user-data", "meta-data", "", "network-data", nil, func(capmox.CloudInitUpload) error { return nil })
 	require.ErrorContains(t, err, "ownership tag task wait was ambiguous")
 	require.Equal(t, 1, configCalls, "failed ownership task must not advance to upload or mount config")
 	require.Zero(t, storageCalls, "ownership marker must be durable before storage discovery or upload")
@@ -746,7 +746,7 @@ func TestCloudInitRecoveredUploadTagsMountsAndPreservesBoot(t *testing.T) {
 		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": completedTask}))
 
 	var uploadStates []capmox.CloudInitUpload
-	err = client.CloudInit(context.Background(), vm, "machine-uid", "ide0", "user-data", "meta-data", "", "network-data", func(upload capmox.CloudInitUpload) error {
+	err = client.CloudInit(context.Background(), vm, "machine-uid", "ide0", "user-data", "meta-data", "", "network-data", nil, func(upload capmox.CloudInitUpload) error {
 		uploadStates = append(uploadStates, upload)
 		return nil
 	})
@@ -769,6 +769,60 @@ func TestCloudInitRecoveredUploadTagsMountsAndPreservesBoot(t *testing.T) {
 	require.Equal(t, "local:iso/"+uploadedName, uploadStates[1].VolID)
 	_, decodeErr := hex.DecodeString(uploadedChecksum)
 	require.NoError(t, decodeErr)
+}
+
+func TestCloudInitResumesAcceptedUploadWithoutRedispatch(t *testing.T) {
+	client := newTestClient(t)
+	const (
+		userdata      = "user-data"
+		metadata      = "meta-data"
+		networkConfig = "network-data"
+	)
+	isoPath, err := makeCloudInitISO(userdata, metadata, "", networkConfig)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = os.Remove(isoPath) })
+	_, size, err := fileSHA256(isoPath)
+	require.NoError(t, err)
+	isoName, err := cloudInitISOName("machine-uid", cloudInitBootstrapDigest(userdata, metadata, "", networkConfig))
+	require.NoError(t, err)
+	uploadUPID := proxmox.UPID("UPID:pve:003B4235:1DF4ABCA:667C1C45:imgcopy:local:root@pam:")
+	mountUPID := proxmox.UPID("UPID:pve:003B4236:1DF4ABCB:667C1C46:qmconfig:320:root@pam:")
+	current := &capmox.CloudInitUpload{
+		Version: 1, Node: "pve", Storage: "local", VolID: "local:iso/" + isoName, Size: size,
+		UPID: string(uploadUPID), Phase: capmox.CloudInitUploadPhaseAccepted,
+	}
+	cloudInitTag := proxmox.MakeTag(proxmox.TagCloudInit)
+	vm := &proxmox.VirtualMachine{Node: "pve", VMID: 320, VirtualMachineConfig: &proxmox.VirtualMachineConfig{
+		IDE0: cloudInitUnmountedDeviceValue, Tags: cloudInitTag, TagsSlice: []string{cloudInitTag},
+	}}
+	vm.New(client.Client, "pve", 320)
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve/status$`,
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": proxmox.Node{Name: "pve"}}))
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve/storage/local/status$`,
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": proxmox.Storage{Name: "local", Content: "iso", Enabled: 1, Avail: 1 << 30}}))
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve/storage/local/content$`,
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": []*proxmox.StorageContent{{Volid: current.VolID, Format: "iso", Size: size}}}))
+	httpmock.RegisterResponder(http.MethodGet, fmt.Sprintf(`=~/nodes/pve/tasks/%s/status$`, string(uploadUPID)),
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": proxmox.Task{UPID: uploadUPID, Node: "pve", Status: "stopped", ExitStatus: "OK"}}))
+	mountCalls := 0
+	httpmock.RegisterResponder(http.MethodPost, `=~/nodes/pve/qemu/320/config$`, func(*http.Request) (*http.Response, error) {
+		mountCalls++
+		return httpmock.NewJsonResponse(200, map[string]any{"data": mountUPID})
+	})
+	httpmock.RegisterResponder(http.MethodGet, fmt.Sprintf(`=~/nodes/pve/tasks/%s/status$`, string(mountUPID)),
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": proxmox.Task{UPID: mountUPID, Node: "pve", Status: "stopped", ExitStatus: "OK"}}))
+	var recorded []capmox.CloudInitUpload
+
+	err = client.CloudInit(context.Background(), vm, "machine-uid", "ide0", userdata, metadata, "", networkConfig, current, func(upload capmox.CloudInitUpload) error {
+		recorded = append(recorded, upload)
+		return nil
+	})
+	require.NoError(t, err)
+	require.Len(t, recorded, 1)
+	require.Equal(t, capmox.CloudInitUploadPhaseComplete, recorded[0].Phase)
+	require.Equal(t, string(uploadUPID), recorded[0].UPID)
+	require.Equal(t, 1, mountCalls)
+	require.Zero(t, httpmock.GetCallCountInfo()["POST =~/nodes/pve/storage/local/upload$"], "restart replay must not dispatch a second upload")
 }
 
 func TestRecoverOwnedCloudInitVolumeRejectsCrossStorageDuplicates(t *testing.T) {
@@ -934,10 +988,15 @@ func TestFindCloudInitUploadTargetDeletesOneSupersededMachineArtifactBeforeUploa
 		IDE0: "local:iso/" + oldName + ",media=cdrom,size=4M", Tags: cloudInitTag, TagsSlice: []string{cloudInitTag},
 	}}
 	vm.New(client.Client, "pve", 320)
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve/qemu/320/status/current$`,
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": proxmox.VirtualMachine{Node: "pve", VMID: 320}}))
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve/qemu/320/config$`,
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": proxmox.VirtualMachineConfig{IDE0: cloudInitUnmountedDeviceValue}}))
 	require.NoError(t, client.reconcileSupersededCloudInitArtifact(context.Background(), vm, "machine-uid", "ide0", "local:iso/"+newName, selection.supersededStorage, selection.supersededVolID))
 	require.Equal(t, 1, deleteCalls, "changed bootstrap must reconcile the sole superseded immutable artifact before upload")
 	require.Equal(t, 1, ide0Writes, "mounted superseded media must be unmounted before its backing volume is deleted")
 	require.False(t, oldPresent)
+	require.Equal(t, cloudInitUnmountedDeviceValue, vm.VirtualMachineConfig.IDE0, "caller must continue from refetched post-unmount state")
 }
 
 func TestFindCloudInitUploadTargetRejectsMultipleSupersededMachineArtifacts(t *testing.T) {

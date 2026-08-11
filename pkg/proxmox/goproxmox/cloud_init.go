@@ -61,7 +61,7 @@ type cloudInitStorage interface {
 // the immutable ProxmoxMachine UID to a canonical digest of the logical
 // bootstrap inputs. The upload checksum separately proves the finalized ISO
 // bytes, whose filesystem metadata need not be reproducible between retries.
-func (c *APIClient) CloudInit(ctx context.Context, vm *proxmox.VirtualMachine, machineIdentity, device, userdata, metadata, vendordata, networkconfig string, recorder capmox.CloudInitUploadRecorder) error {
+func (c *APIClient) CloudInit(ctx context.Context, vm *proxmox.VirtualMachine, machineIdentity, device, userdata, metadata, vendordata, networkconfig string, current *capmox.CloudInitUpload, recorder capmox.CloudInitUploadRecorder) error {
 	if recorder == nil {
 		return errors.New("cloud-init upload recorder is required")
 	}
@@ -93,6 +93,15 @@ func (c *APIClient) CloudInit(ctx context.Context, vm *proxmox.VirtualMachine, m
 	// provisioning attempt that may own an unattached immutable artifact.
 	if err := addCloudInitOwnershipTag(ctx, vm); err != nil {
 		return err
+	}
+	if current != nil {
+		handled, err := c.resumeCloudInitUpload(ctx, node, vm, machineIdentity, device, isoName, size, current, recorder)
+		if err != nil {
+			return err
+		}
+		if handled {
+			return nil
+		}
 	}
 
 	selection, err := findCloudInitUploadTarget(ctx, node, machineIdentity, isoName, size)
@@ -144,6 +153,66 @@ func (c *APIClient) CloudInit(ctx context.Context, vm *proxmox.VirtualMachine, m
 	}
 
 	return mountCloudInitISO(ctx, vm, machineIdentity, device, expectedVolID)
+}
+
+func (c *APIClient) resumeCloudInitUpload(ctx context.Context, node *proxmox.Node, vm *proxmox.VirtualMachine, machineIdentity, device, isoName string, size uint64, current *capmox.CloudInitUpload, recorder capmox.CloudInitUploadRecorder) (bool, error) {
+	if current.Version != 1 || current.Node != node.Name || current.Storage == "" || current.Size == 0 {
+		return true, fmt.Errorf("invalid durable cloud-init upload state: version=%d node=%q storage=%q size=%d", current.Version, current.Node, current.Storage, current.Size)
+	}
+	expectedVolID := current.Storage + ":iso/" + isoName
+	exact := current.VolID == expectedVolID && current.Size == size
+	if !exact {
+		if current.Phase == capmox.CloudInitUploadPhaseComplete {
+			return false, nil
+		}
+		if err := c.reconcileRecordedCloudInitUpload(ctx, node, machineIdentity, current); err != nil {
+			return true, fmt.Errorf("%w: reconcile superseded durable upload: %v", capmox.ErrCloudInitUploadPending, err)
+		}
+		return false, nil
+	}
+	storage, err := node.Storage(ctx, current.Storage)
+	if err != nil {
+		return true, fmt.Errorf("%w: get recorded storage %q: %v", capmox.ErrCloudInitUploadPending, current.Storage, err)
+	}
+	switch current.Phase {
+	case capmox.CloudInitUploadPhaseIntent:
+		present, inspectErr := inspectCloudInitISO(ctx, storage, current.Storage, isoName, size)
+		if inspectErr != nil || !present {
+			return true, fmt.Errorf("%w: exact intent artifact is not yet proven: %v", capmox.ErrCloudInitUploadPending, inspectErr)
+		}
+	case capmox.CloudInitUploadPhaseAccepted:
+		if current.UPID == "" {
+			return true, errors.New("accepted durable cloud-init upload has no task UPID")
+		}
+		task, taskErr := c.GetTask(ctx, current.UPID)
+		if taskErr != nil {
+			return true, fmt.Errorf("%w: get accepted upload task %q: %v", capmox.ErrCloudInitUploadPending, current.UPID, taskErr)
+		}
+		waitErr := waitForCloudInitTask(ctx, task, 2)
+		if task.IsFailed || (task.ExitStatus != "" && task.ExitStatus != "OK") {
+			return true, fmt.Errorf("accepted cloud-init upload task failed with exit status %q", task.ExitStatus)
+		}
+		if proofErr := requireCloudInitISO(ctx, storage, current.Storage, isoName, size); proofErr != nil {
+			return true, fmt.Errorf("%w: accepted upload is not yet proven (wait=%v proof=%v)", capmox.ErrCloudInitUploadPending, waitErr, proofErr)
+		}
+	case capmox.CloudInitUploadPhaseComplete:
+		if err := requireCloudInitISO(ctx, storage, current.Storage, isoName, size); err != nil {
+			return true, fmt.Errorf("completed durable upload lost exact artifact proof: %w", err)
+		}
+	default:
+		return true, fmt.Errorf("invalid durable cloud-init upload phase %q", current.Phase)
+	}
+	if current.Phase != capmox.CloudInitUploadPhaseComplete {
+		completed := *current
+		completed.Phase = capmox.CloudInitUploadPhaseComplete
+		if err := recorder(completed); err != nil {
+			return true, fmt.Errorf("record resumed cloud-init upload completion: %w", err)
+		}
+	}
+	if err := mountCloudInitISO(ctx, vm, machineIdentity, device, expectedVolID); err != nil {
+		return true, err
+	}
+	return true, nil
 }
 
 func validateCloudInitTargetDevice(vm *proxmox.VirtualMachine, machineIdentity, device string) error {
@@ -267,6 +336,9 @@ func (c *APIClient) reconcileSupersededCloudInitArtifact(ctx context.Context, vm
 		case supersededVolID:
 			if err := c.UnmountCloudInitISO(ctx, vm, machineIdentity, device); err != nil {
 				return fmt.Errorf("unmount superseded cloud-init artifact %q: %w", supersededVolID, err)
+			}
+			if err := vm.Ping(ctx); err != nil {
+				return fmt.Errorf("refetch VM after superseded cloud-init cleanup: %w", err)
 			}
 			if err := addCloudInitOwnershipTag(ctx, vm); err != nil {
 				return fmt.Errorf("restore cloud-init ownership tag after superseded cleanup: %w", err)

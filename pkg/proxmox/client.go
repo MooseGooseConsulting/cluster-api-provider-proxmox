@@ -28,6 +28,10 @@ import (
 // that must be retried without terminalizing Machine provisioning.
 var ErrCloudInitStorageDiscoveryRetryable = errors.New("cloud-init storage discovery is retryable")
 
+// ErrCloudInitUploadPending marks a durable upload whose exact task or artifact
+// is not yet terminally observable. Reconciliation must not dispatch again.
+var ErrCloudInitUploadPending = errors.New("cloud-init upload is pending")
+
 // CloudInitUpload records the durable identity and progress of one immutable
 // cloud-init upload. Callers persist each update before CloudInit continues.
 type CloudInitUpload struct {
@@ -57,7 +61,7 @@ type Client interface {
 	CloneVM(ctx context.Context, templateID int, clone VMCloneRequest) (VMCloneResponse, error)
 
 	ConfigureVM(ctx context.Context, vm *proxmox.VirtualMachine, options ...VirtualMachineOption) (*proxmox.Task, error)
-	CloudInit(ctx context.Context, vm *proxmox.VirtualMachine, machineIdentity, device, userdata, metadata, vendordata, networkconfig string, recorder CloudInitUploadRecorder) error
+	CloudInit(ctx context.Context, vm *proxmox.VirtualMachine, machineIdentity, device, userdata, metadata, vendordata, networkconfig string, current *CloudInitUpload, recorder CloudInitUploadRecorder) error
 
 	FindVMResource(ctx context.Context, vmID uint64) (*proxmox.ClusterResource, error)
 	FindVMTemplateByTags(ctx context.Context, templateTags []string, resolutionPolicy string) (string, int32, error)
