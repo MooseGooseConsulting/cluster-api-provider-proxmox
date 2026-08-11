@@ -19,6 +19,7 @@ package goproxmox
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -45,8 +46,9 @@ type cloudInitStorage interface {
 }
 
 // CloudInit uploads and mounts a cloud-init ISO. The storage filename binds
-// the immutable ProxmoxMachine UID to the full payload digest. This makes an
-// exact pre-existing object safe restart state even when PVE reuses a VMID.
+// the immutable ProxmoxMachine UID to a canonical digest of the logical
+// bootstrap inputs. The upload checksum separately proves the finalized ISO
+// bytes, whose filesystem metadata need not be reproducible between retries.
 func (c *APIClient) CloudInit(ctx context.Context, vm *proxmox.VirtualMachine, machineIdentity, device, userdata, metadata, vendordata, networkconfig string) error {
 	isoPath, err := makeCloudInitISO(userdata, metadata, vendordata, networkconfig)
 	if err != nil {
@@ -58,7 +60,8 @@ func (c *APIClient) CloudInit(ctx context.Context, vm *proxmox.VirtualMachine, m
 	if err != nil {
 		return fmt.Errorf("hash cloud-init ISO: %w", err)
 	}
-	isoName, err := cloudInitISOName(machineIdentity, digest)
+	bootstrapDigest := cloudInitBootstrapDigest(userdata, metadata, vendordata, networkconfig)
+	isoName, err := cloudInitISOName(machineIdentity, bootstrapDigest)
 	if err != nil {
 		return err
 	}
@@ -98,6 +101,17 @@ func (c *APIClient) CloudInit(ctx context.Context, vm *proxmox.VirtualMachine, m
 		return err
 	}
 	return configTask.WaitFor(ctx, 2)
+}
+
+func cloudInitBootstrapDigest(userdata, metadata, vendordata, networkconfig string) string {
+	h := sha256.New()
+	for _, part := range []string{"capmox-cloud-init-v1", userdata, metadata, vendordata, networkconfig} {
+		var length [8]byte
+		binary.BigEndian.PutUint64(length[:], uint64(len(part)))
+		_, _ = h.Write(length[:])
+		_, _ = io.WriteString(h, part)
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 func cloudInitISOName(machineIdentity, digest string) (string, error) {

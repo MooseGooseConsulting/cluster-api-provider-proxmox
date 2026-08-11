@@ -29,6 +29,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jarcoal/httpmock"
 	"github.com/luthermonson/go-proxmox"
@@ -88,6 +89,62 @@ func TestCloudInitISONameBindsMachineAndPayload(t *testing.T) {
 	require.ErrorContains(t, err, "exceeds PVE limit")
 	_, err = cloudInitISOName("machine-a", strings.ToUpper(digestA))
 	require.ErrorContains(t, err, "lowercase hexadecimal")
+}
+
+func TestCloudInitISONameIsStableAcrossDelayedGenerations(t *testing.T) {
+	tests := []struct {
+		name          string
+		userdata      string
+		metadata      string
+		vendordata    string
+		networkconfig string
+	}{
+		{
+			name:          "cloud-config",
+			userdata:      "#cloud-config\nusers: []\n",
+			metadata:      "instance-id: machine-a\n",
+			networkconfig: "version: 1\nconfig: []\n",
+		},
+		{
+			name:       "ignition",
+			userdata:   `{"ignition":{"version":"3.4.0"}}`,
+			metadata:   `{"instance-id":"machine-a"}`,
+			vendordata: "",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			firstPath, err := makeCloudInitISO(test.userdata, test.metadata, test.vendordata, test.networkconfig)
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = os.Remove(firstPath) })
+			firstDigest := cloudInitBootstrapDigest(test.userdata, test.metadata, test.vendordata, test.networkconfig)
+			firstName, err := cloudInitISOName("machine-a", firstDigest)
+			require.NoError(t, err)
+
+			time.Sleep(1100 * time.Millisecond)
+			secondPath, err := makeCloudInitISO(test.userdata, test.metadata, test.vendordata, test.networkconfig)
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = os.Remove(secondPath) })
+			secondDigest := cloudInitBootstrapDigest(test.userdata, test.metadata, test.vendordata, test.networkconfig)
+			secondName, err := cloudInitISOName("machine-a", secondDigest)
+			require.NoError(t, err)
+			require.Equal(t, firstName, secondName)
+
+			byteDigest, size, err := fileSHA256(secondPath)
+			require.NoError(t, err)
+			storage := &fakeCloudInitStorage{results: []storageResult{{contents: []*proxmox.StorageContent{{
+				Volid:  "local:iso/" + firstName,
+				Format: "iso",
+				Size:   size,
+			}}}}}
+			_, proven, err := uploadCloudInitISO(context.Background(), storage, "local", secondPath, secondName, byteDigest, size)
+			require.NoError(t, err)
+			require.True(t, proven)
+			require.Equal(t, 0, storage.uploadCalls, "stable logical identity must reuse exact preflight artifact")
+			require.Equal(t, 1, storage.contentCalls)
+		})
+	}
 }
 
 func TestUploadCloudInitISOProof(t *testing.T) {
@@ -257,7 +314,8 @@ func TestCloudInitRecoveredUploadTagsMountsAndPreservesBoot(t *testing.T) {
 	require.Equal(t, "sha256", uploadedAlgorithm)
 	require.Equal(t, cloudInitDigestLength, len(uploadedChecksum))
 	require.Equal(t, uploadedDigest, uploadedChecksum)
-	require.Equal(t, "user-data-machine-uid-"+uploadedChecksum+".iso", uploadedName)
+	logicalDigest := cloudInitBootstrapDigest("user-data", "meta-data", "", "network-data")
+	require.Equal(t, "user-data-machine-uid-"+logicalDigest+".iso", uploadedName)
 	require.Equal(t, "local:iso/"+uploadedName+",media=cdrom", mounted)
 	require.Equal(t, "order=scsi0;net0;ide0", boot)
 	_, decodeErr := hex.DecodeString(uploadedChecksum)
