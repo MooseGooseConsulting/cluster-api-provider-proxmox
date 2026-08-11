@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/go-logr/logr"
@@ -691,6 +692,76 @@ func TestProxmoxAPIClient_DeleteVM(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestDeleteVMAbsentLegacyRecoverySkipsIneligibleUnavailableStorages(t *testing.T) {
+	client := newTestClient(t)
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve-n5/status$`,
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": proxmox.Node{Name: "pve-n5"}}))
+	httpmock.RegisterResponder(http.MethodGet, `=~/cluster/status$`,
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": proxmox.NodeStatuses{{Name: "pve-n5"}}}))
+	httpmock.RegisterResponder(http.MethodGet, `=~/cluster/nextid$`,
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": "320"}))
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve-n5/storage$`,
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": &proxmox.Storages{
+			{Name: "local", Content: "iso,vztmpl", Enabled: 1},
+			{Name: "local-zfs", Content: "images,rootdir", Enabled: 1},
+			{Name: "vmdata", Content: "images", Enabled: 1},
+			{Name: "aoostar-usb-staging", Content: "iso", Enabled: 0},
+		}}))
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve-n5/storage/local/content$`,
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": []*proxmox.StorageContent{}}))
+	for _, storageName := range []string{"local-zfs", "vmdata", "aoostar-usb-staging"} {
+		httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve-n5/storage/`+storageName+`/content$`,
+			httpmock.NewJsonResponderOrPanic(500, map[string]any{"data": nil}))
+	}
+
+	_, err := client.DeleteVM(context.Background(), "pve-n5", 320, "machine-uid", nil)
+	require.ErrorIs(t, err, ErrVMIDFree)
+	require.Equal(t, 1, httpmock.GetCallCountInfo()["GET =~/nodes/pve-n5/storage/local/content$"])
+	for _, storageName := range []string{"local-zfs", "vmdata", "aoostar-usb-staging"} {
+		require.Zero(t, httpmock.GetCallCountInfo()["GET =~/nodes/pve-n5/storage/"+storageName+"/content$"],
+			"legacy recovery must not inspect an ineligible storage")
+	}
+}
+
+func TestRecoverLegacyOwnedCloudInitVolumeFailsClosedOnEligibleStorageError(t *testing.T) {
+	client := newTestClient(t)
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve-n5/status$`,
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": proxmox.Node{Name: "pve-n5"}}))
+	node, err := client.Node(context.Background(), "pve-n5")
+	require.NoError(t, err)
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve-n5/storage$`,
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": &proxmox.Storages{{Name: "local", Content: "iso", Enabled: 1}}}))
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve-n5/storage/local/content$`,
+		httpmock.NewJsonResponderOrPanic(500, map[string]any{"data": nil}))
+
+	_, _, err = recoverLegacyOwnedCloudInitVolume(context.Background(), node, "machine-uid")
+	require.ErrorContains(t, err, `inspect storage "local"`)
+}
+
+func TestRecoverLegacyOwnedCloudInitVolumeRejectsEligibleDuplicates(t *testing.T) {
+	client := newTestClient(t)
+	digest := strings.Repeat("a", cloudInitDigestLength)
+	isoName := "user-data-machine-uid-" + digest + ".iso"
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve-n5/status$`,
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": proxmox.Node{Name: "pve-n5"}}))
+	node, err := client.Node(context.Background(), "pve-n5")
+	require.NoError(t, err)
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve-n5/storage$`,
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": &proxmox.Storages{
+			{Name: "local", Content: "iso", Enabled: 1},
+			{Name: "shared", Content: "images,iso", Enabled: 1},
+		}}))
+	for _, storageName := range []string{"local", "shared"} {
+		httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve-n5/storage/`+storageName+`/content$`,
+			httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": []*proxmox.StorageContent{{
+				Volid: storageName + ":iso/" + isoName, Format: "iso", Size: 4096,
+			}}}))
+	}
+
+	_, _, err = recoverLegacyOwnedCloudInitVolume(context.Background(), node, "machine-uid")
+	require.ErrorContains(t, err, "multiple owned cloud-init volumes")
 }
 
 func TestDeleteVMWaitsForRecordedUploadThenCleansLateArtifact(t *testing.T) {
