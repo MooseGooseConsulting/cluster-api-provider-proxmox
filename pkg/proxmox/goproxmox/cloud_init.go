@@ -30,6 +30,8 @@ import (
 	"github.com/diskfs/go-diskfs/backend/file"
 	"github.com/diskfs/go-diskfs/filesystem/iso9660"
 	"github.com/luthermonson/go-proxmox"
+
+	capmox "github.com/ionos-cloud/cluster-api-provider-proxmox/pkg/proxmox"
 )
 
 const (
@@ -56,7 +58,10 @@ type cloudInitStorage interface {
 // the immutable ProxmoxMachine UID to a canonical digest of the logical
 // bootstrap inputs. The upload checksum separately proves the finalized ISO
 // bytes, whose filesystem metadata need not be reproducible between retries.
-func (c *APIClient) CloudInit(ctx context.Context, vm *proxmox.VirtualMachine, machineIdentity, device, userdata, metadata, vendordata, networkconfig string) error {
+func (c *APIClient) CloudInit(ctx context.Context, vm *proxmox.VirtualMachine, machineIdentity, device, userdata, metadata, vendordata, networkconfig string, recorder capmox.CloudInitUploadRecorder) error {
+	if recorder == nil {
+		return errors.New("cloud-init upload recorder is required")
+	}
 	isoPath, err := makeCloudInitISO(userdata, metadata, vendordata, networkconfig)
 	if err != nil {
 		return err
@@ -89,19 +94,43 @@ func (c *APIClient) CloudInit(ctx context.Context, vm *proxmox.VirtualMachine, m
 		return fmt.Errorf("find exact cloud-init ISO upload target on node %q: %w", vm.Node, err)
 	}
 
+	expectedVolID := fmt.Sprintf("%s:iso/%s", storage.Name, isoName)
+	uploadState := capmox.CloudInitUpload{
+		Version: 1,
+		Node:    vm.Node,
+		Storage: storage.Name,
+		VolID:   expectedVolID,
+		Size:    size,
+		Phase:   capmox.CloudInitUploadPhaseIntent,
+	}
+	if err := recorder(uploadState); err != nil {
+		return fmt.Errorf("record cloud-init upload intent: %w", err)
+	}
+
 	uploadTask, proven, err := uploadCloudInitISO(ctx, storage, storage.Name, isoPath, isoName, digest, size)
 	if err != nil {
 		return err
 	}
 	if !proven {
+		if uploadTask == nil {
+			return errors.New("cloud-init ISO upload returned no task")
+		}
+		uploadState.UPID = string(uploadTask.UPID)
+		uploadState.Phase = capmox.CloudInitUploadPhaseAccepted
+		if err := recorder(uploadState); err != nil {
+			return fmt.Errorf("record accepted cloud-init upload task: %w", err)
+		}
 		if err := waitForCloudInitEffect(ctx, uploadTask, 5, "cloud-init ISO upload", true, func() error {
 			return requireCloudInitISO(ctx, storage, storage.Name, isoName, size)
 		}); err != nil {
 			return err
 		}
 	}
+	uploadState.Phase = capmox.CloudInitUploadPhaseComplete
+	if err := recorder(uploadState); err != nil {
+		return fmt.Errorf("record completed cloud-init upload: %w", err)
+	}
 
-	expectedVolID := fmt.Sprintf("%s:iso/%s", storage.Name, isoName)
 	return mountCloudInitISO(ctx, vm, machineIdentity, device, expectedVolID)
 }
 

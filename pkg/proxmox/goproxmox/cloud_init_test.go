@@ -34,6 +34,8 @@ import (
 	"github.com/jarcoal/httpmock"
 	"github.com/luthermonson/go-proxmox"
 	"github.com/stretchr/testify/require"
+
+	capmox "github.com/ionos-cloud/cluster-api-provider-proxmox/pkg/proxmox"
 )
 
 type storageResult struct {
@@ -370,7 +372,7 @@ func TestCloudInitOwnershipTagTaskFailureBlocksContinuation(t *testing.T) {
 	t.Cleanup(func() { waitForCloudInitTask = originalWait })
 	waitForCloudInitTask = func(context.Context, *proxmox.Task, int) error { return errors.New("tag task failed") }
 
-	err = client.CloudInit(context.Background(), vm, "machine-uid", "ide0", "user-data", "meta-data", "", "network-data")
+	err = client.CloudInit(context.Background(), vm, "machine-uid", "ide0", "user-data", "meta-data", "", "network-data", func(capmox.CloudInitUpload) error { return nil })
 	require.ErrorContains(t, err, "wait for cloud-init ownership tag")
 	require.Equal(t, 1, configCalls, "failed ownership task must not advance to upload or mount config")
 	require.Zero(t, storageCalls, "ownership marker must be durable before storage discovery or upload")
@@ -670,7 +672,11 @@ func TestCloudInitRecoveredUploadTagsMountsAndPreservesBoot(t *testing.T) {
 	httpmock.RegisterResponder(http.MethodGet, fmt.Sprintf(`=~/nodes/pve/tasks/%s/status$`, string(upid)),
 		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": completedTask}))
 
-	err = client.CloudInit(context.Background(), vm, "machine-uid", "ide0", "user-data", "meta-data", "", "network-data")
+	var uploadStates []capmox.CloudInitUpload
+	err = client.CloudInit(context.Background(), vm, "machine-uid", "ide0", "user-data", "meta-data", "", "network-data", func(upload capmox.CloudInitUpload) error {
+		uploadStates = append(uploadStates, upload)
+		return nil
+	})
 	require.NoError(t, err)
 	require.Equal(t, 1, uploadCalls)
 	require.Equal(t, 3, contentCalls)
@@ -683,6 +689,11 @@ func TestCloudInitRecoveredUploadTagsMountsAndPreservesBoot(t *testing.T) {
 	require.Equal(t, "user-data-machine-uid-"+logicalDigest+".iso", uploadedName)
 	require.Equal(t, "local:iso/"+uploadedName+",media=cdrom", mounted)
 	require.Equal(t, "order=scsi0;net0;ide0", boot)
+	require.Len(t, uploadStates, 2, "an EOF response with exact storage proof has no task UPID to persist")
+	require.Equal(t, capmox.CloudInitUploadPhaseIntent, uploadStates[0].Phase)
+	require.Empty(t, uploadStates[0].UPID)
+	require.Equal(t, capmox.CloudInitUploadPhaseComplete, uploadStates[1].Phase)
+	require.Equal(t, "local:iso/"+uploadedName, uploadStates[1].VolID)
 	_, decodeErr := hex.DecodeString(uploadedChecksum)
 	require.NoError(t, decodeErr)
 }

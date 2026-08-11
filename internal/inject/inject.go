@@ -25,6 +25,7 @@ import (
 
 	"github.com/ionos-cloud/cluster-api-provider-proxmox/pkg/cloudinit"
 	"github.com/ionos-cloud/cluster-api-provider-proxmox/pkg/ignition"
+	capmox "github.com/ionos-cloud/cluster-api-provider-proxmox/pkg/proxmox"
 
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
@@ -36,9 +37,10 @@ const CloudInitISODevice = "ide0"
 type ISOInjector struct {
 	VirtualMachine *proxmox.VirtualMachine
 	ProxmoxClient  interface {
-		CloudInit(ctx context.Context, vm *proxmox.VirtualMachine, machineIdentity, device, userdata, metadata, vendordata, networkconfig string) error
+		CloudInit(ctx context.Context, vm *proxmox.VirtualMachine, machineIdentity, device, userdata, metadata, vendordata, networkconfig string, recorder capmox.CloudInitUploadRecorder) error
 	}
 	MachineIdentity string
+	UploadRecorder  capmox.CloudInitUploadRecorder
 
 	BootstrapData []byte
 
@@ -81,7 +83,7 @@ func (i *ISOInjector) injectCloudInit(ctx context.Context) error {
 	logger.V(4).Info("CloudInit:", "network-config", string(network))
 
 	// Inject an ISO with userdata, metadata and network-config into the VirtualMachine.
-	err = i.ProxmoxClient.CloudInit(ctx, i.VirtualMachine, i.MachineIdentity, CloudInitISODevice, string(i.BootstrapData), string(metadata), "", string(network))
+	err = i.ProxmoxClient.CloudInit(ctx, i.VirtualMachine, i.MachineIdentity, CloudInitISODevice, string(i.BootstrapData), string(metadata), "", string(network), i.UploadRecorder)
 	if err != nil {
 		return errors.Wrap(err, "unable to inject CloudInit ISO")
 	}
@@ -121,7 +123,7 @@ func (i *ISOInjector) injectIgnition(ctx context.Context) error {
 	logger.V(4).Info("Ingnition", "bootstrapData", bootstrapData)
 
 	// Inject an ISO with ignition userdata, metadata and an empty network-config v1 into the VirtualMachine.
-	err = i.ProxmoxClient.CloudInit(ctx, i.VirtualMachine, i.MachineIdentity, CloudInitISODevice, string(bootstrapData), string(metadata), "", string(cloudinit.EmptyNetworkV1))
+	err = i.ProxmoxClient.CloudInit(ctx, i.VirtualMachine, i.MachineIdentity, CloudInitISODevice, string(bootstrapData), string(metadata), "", string(cloudinit.EmptyNetworkV1), i.UploadRecorder)
 	if err != nil {
 		return errors.Wrap(err, "unable to inject ignition userdata iso")
 	}

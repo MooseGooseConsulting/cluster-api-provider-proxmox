@@ -33,6 +33,7 @@ import (
 	"github.com/ionos-cloud/cluster-api-provider-proxmox/pkg/cloudinit"
 	"github.com/ionos-cloud/cluster-api-provider-proxmox/pkg/ignition"
 	"github.com/ionos-cloud/cluster-api-provider-proxmox/pkg/network"
+	capmox "github.com/ionos-cloud/cluster-api-provider-proxmox/pkg/proxmox"
 	"github.com/ionos-cloud/cluster-api-provider-proxmox/pkg/proxmox/goproxmox"
 )
 
@@ -108,12 +109,17 @@ func TestISOInjectorInjectCloudInit(t *testing.T) {
 	vm, err := client.GetVM(context.Background(), "pve", 100)
 	require.NoError(t, err)
 
+	var uploadStates []capmox.CloudInitUpload
 	injector := &ISOInjector{
 		VirtualMachine:  vm,
 		ProxmoxClient:   client,
 		MachineIdentity: "test-machine-uid",
-		BootstrapData:   []byte(""),
-		MetaRenderer:    cloudinit.NewMetadata("xxx-xxxx", "my-custom-vm", "1.2.3", true),
+		UploadRecorder: func(upload capmox.CloudInitUpload) error {
+			uploadStates = append(uploadStates, upload)
+			return nil
+		},
+		BootstrapData: []byte(""),
+		MetaRenderer:  cloudinit.NewMetadata("xxx-xxxx", "my-custom-vm", "1.2.3", true),
 		NetworkRenderer: cloudinit.NewNetworkConfig([]network.ConfigData{
 			{
 				Type:       "ethernet",
@@ -153,6 +159,11 @@ func TestISOInjectorInjectCloudInit(t *testing.T) {
 
 	err = injector.Inject(context.Background(), "cloud-config")
 	require.NoError(t, err)
+	require.Len(t, uploadStates, 3)
+	require.Equal(t, capmox.CloudInitUploadPhaseIntent, uploadStates[0].Phase)
+	require.Equal(t, capmox.CloudInitUploadPhaseAccepted, uploadStates[1].Phase)
+	require.Equal(t, string(ptask.UPID), uploadStates[1].UPID)
+	require.Equal(t, capmox.CloudInitUploadPhaseComplete, uploadStates[2].Phase)
 }
 
 func TestISOInjectorInjectCloudInit_Errors(t *testing.T) {
@@ -244,6 +255,7 @@ func TestISOInjectorInjectIgnition(t *testing.T) {
 		VirtualMachine:   vm,
 		ProxmoxClient:    client,
 		MachineIdentity:  "test-machine-uid",
+		UploadRecorder:   func(capmox.CloudInitUpload) error { return nil },
 		BootstrapData:    []byte(bootstrapData),
 		MetaRenderer:     cloudinit.NewMetadata("xxx-xxxx", "my-custom-vm", "1.2.3", false),
 		IgnitionEnricher: enricher,

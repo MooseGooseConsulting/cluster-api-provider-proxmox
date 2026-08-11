@@ -123,7 +123,7 @@ func injectCloudInit(ctx context.Context, machineScope *scope.MachineScope, boot
 	// create metadata renderer
 	metadata := cloudinit.NewMetadata(biosUUID, machineScope.Name(), kubernetesVersion, *ptr.Deref(machineScope.ProxmoxMachine.Spec.MetadataSettings, infrav1.MetadataSettings{ProviderIDInjection: new(false)}).ProviderIDInjection)
 
-	injector := getISOInjector(machineScope.InfraCluster.ProxmoxClient, string(machineScope.ProxmoxMachine.UID), machineScope.VirtualMachine, bootstrapData, metadata, network)
+	injector := getISOInjector(machineScope.InfraCluster.ProxmoxClient, string(machineScope.ProxmoxMachine.UID), machineScope.VirtualMachine, bootstrapData, metadata, network, cloudInitUploadRecorder(machineScope))
 	return injector.Inject(ctx, inject.CloudConfigFormat)
 }
 
@@ -140,7 +140,7 @@ func injectIgnition(ctx context.Context, machineScope *scope.MachineScope, boots
 		Network:       nicData,
 	}
 
-	injector := getIgnitionISOInjector(machineScope.InfraCluster.ProxmoxClient, string(machineScope.ProxmoxMachine.UID), machineScope.VirtualMachine, metadata, enricher)
+	injector := getIgnitionISOInjector(machineScope.InfraCluster.ProxmoxClient, string(machineScope.ProxmoxMachine.UID), machineScope.VirtualMachine, metadata, enricher, cloudInitUploadRecorder(machineScope))
 	return injector.Inject(ctx, inject.IgnitionFormat)
 }
 
@@ -148,22 +148,24 @@ type isoInjector interface {
 	Inject(ctx context.Context, format inject.BootstrapDataFormat) error
 }
 
-func defaultISOInjector(client capmox.Client, machineIdentity string, vm *proxmox.VirtualMachine, bootStrapData []byte, metadata, network cloudinit.Renderer) isoInjector {
+func defaultISOInjector(client capmox.Client, machineIdentity string, vm *proxmox.VirtualMachine, bootStrapData []byte, metadata, network cloudinit.Renderer, recorder capmox.CloudInitUploadRecorder) isoInjector {
 	return &inject.ISOInjector{
 		VirtualMachine:  vm,
 		ProxmoxClient:   client,
 		MachineIdentity: machineIdentity,
+		UploadRecorder:  recorder,
 		BootstrapData:   bootStrapData,
 		MetaRenderer:    metadata,
 		NetworkRenderer: network,
 	}
 }
 
-func defaultIgnitionISOInjector(client capmox.Client, machineIdentity string, vm *proxmox.VirtualMachine, metadata cloudinit.Renderer, enricher *ignition.Enricher) isoInjector {
+func defaultIgnitionISOInjector(client capmox.Client, machineIdentity string, vm *proxmox.VirtualMachine, metadata cloudinit.Renderer, enricher *ignition.Enricher, recorder capmox.CloudInitUploadRecorder) isoInjector {
 	return &inject.ISOInjector{
 		VirtualMachine:   vm,
 		ProxmoxClient:    client,
 		MachineIdentity:  machineIdentity,
+		UploadRecorder:   recorder,
 		IgnitionEnricher: enricher,
 		MetaRenderer:     metadata,
 	}
@@ -173,6 +175,42 @@ var (
 	getISOInjector         = defaultISOInjector
 	getIgnitionISOInjector = defaultIgnitionISOInjector
 )
+
+const cloudInitUploadAnnotation = "infrastructure.cluster.x-k8s.io/cloud-init-upload"
+
+func cloudInitUploadRecorder(machineScope *scope.MachineScope) capmox.CloudInitUploadRecorder {
+	return func(upload capmox.CloudInitUpload) error {
+		encoded, err := json.Marshal(upload)
+		if err != nil {
+			return errors.Wrap(err, "encode cloud-init upload state")
+		}
+		annotations := machineScope.ProxmoxMachine.GetAnnotations()
+		if annotations == nil {
+			annotations = map[string]string{}
+		}
+		if annotations[cloudInitUploadAnnotation] == string(encoded) {
+			return nil
+		}
+		annotations[cloudInitUploadAnnotation] = string(encoded)
+		machineScope.ProxmoxMachine.SetAnnotations(annotations)
+		if err := machineScope.PatchObject(); err != nil {
+			return errors.Wrap(err, "persist cloud-init upload state")
+		}
+		return nil
+	}
+}
+
+func cloudInitUploadState(machineScope *scope.MachineScope) (*capmox.CloudInitUpload, error) {
+	raw := machineScope.ProxmoxMachine.GetAnnotations()[cloudInitUploadAnnotation]
+	if raw == "" {
+		return nil, nil
+	}
+	var upload capmox.CloudInitUpload
+	if err := json.Unmarshal([]byte(raw), &upload); err != nil {
+		return nil, errors.Wrap(err, "decode cloud-init upload state")
+	}
+	return &upload, nil
+}
 
 // getBootstrapData obtains a machine's bootstrap data from the relevant K8s secret and returns the data.
 // TODO: Add format return if ignition will be supported.

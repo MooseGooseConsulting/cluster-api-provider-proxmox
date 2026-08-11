@@ -139,17 +139,17 @@ func (_c *MockClient_CloneVM_Call) RunAndReturn(run func(context.Context, int, p
 	return _c
 }
 
-// CloudInit provides a mock function with given fields: ctx, vm, machineIdentity, device, userdata, metadata, vendordata, networkconfig
-func (_m *MockClient) CloudInit(ctx context.Context, vm *go_proxmox.VirtualMachine, machineIdentity string, device string, userdata string, metadata string, vendordata string, networkconfig string) error {
-	ret := _m.Called(ctx, vm, machineIdentity, device, userdata, metadata, vendordata, networkconfig)
+// CloudInit provides a mock function with given fields: ctx, vm, machineIdentity, device, userdata, metadata, vendordata, networkconfig, recorder
+func (_m *MockClient) CloudInit(ctx context.Context, vm *go_proxmox.VirtualMachine, machineIdentity string, device string, userdata string, metadata string, vendordata string, networkconfig string, recorder proxmox.CloudInitUploadRecorder) error {
+	ret := _m.Called(ctx, vm, machineIdentity, device, userdata, metadata, vendordata, networkconfig, recorder)
 
 	if len(ret) == 0 {
 		panic("no return value specified for CloudInit")
 	}
 
 	var r0 error
-	if rf, ok := ret.Get(0).(func(context.Context, *go_proxmox.VirtualMachine, string, string, string, string, string, string) error); ok {
-		r0 = rf(ctx, vm, machineIdentity, device, userdata, metadata, vendordata, networkconfig)
+	if rf, ok := ret.Get(0).(func(context.Context, *go_proxmox.VirtualMachine, string, string, string, string, string, string, proxmox.CloudInitUploadRecorder) error); ok {
+		r0 = rf(ctx, vm, machineIdentity, device, userdata, metadata, vendordata, networkconfig, recorder)
 	} else {
 		r0 = ret.Error(0)
 	}
@@ -171,13 +171,14 @@ type MockClient_CloudInit_Call struct {
 //   - metadata string
 //   - vendordata string
 //   - networkconfig string
-func (_e *MockClient_Expecter) CloudInit(ctx interface{}, vm interface{}, machineIdentity interface{}, device interface{}, userdata interface{}, metadata interface{}, vendordata interface{}, networkconfig interface{}) *MockClient_CloudInit_Call {
-	return &MockClient_CloudInit_Call{Call: _e.mock.On("CloudInit", ctx, vm, machineIdentity, device, userdata, metadata, vendordata, networkconfig)}
+//   - recorder proxmox.CloudInitUploadRecorder
+func (_e *MockClient_Expecter) CloudInit(ctx interface{}, vm interface{}, machineIdentity interface{}, device interface{}, userdata interface{}, metadata interface{}, vendordata interface{}, networkconfig interface{}, recorder interface{}) *MockClient_CloudInit_Call {
+	return &MockClient_CloudInit_Call{Call: _e.mock.On("CloudInit", ctx, vm, machineIdentity, device, userdata, metadata, vendordata, networkconfig, recorder)}
 }
 
-func (_c *MockClient_CloudInit_Call) Run(run func(ctx context.Context, vm *go_proxmox.VirtualMachine, machineIdentity string, device string, userdata string, metadata string, vendordata string, networkconfig string)) *MockClient_CloudInit_Call {
+func (_c *MockClient_CloudInit_Call) Run(run func(ctx context.Context, vm *go_proxmox.VirtualMachine, machineIdentity string, device string, userdata string, metadata string, vendordata string, networkconfig string, recorder proxmox.CloudInitUploadRecorder)) *MockClient_CloudInit_Call {
 	_c.Call.Run(func(args mock.Arguments) {
-		run(args[0].(context.Context), args[1].(*go_proxmox.VirtualMachine), args[2].(string), args[3].(string), args[4].(string), args[5].(string), args[6].(string), args[7].(string))
+		run(args[0].(context.Context), args[1].(*go_proxmox.VirtualMachine), args[2].(string), args[3].(string), args[4].(string), args[5].(string), args[6].(string), args[7].(string), args[8].(proxmox.CloudInitUploadRecorder))
 	})
 	return _c
 }
@@ -187,7 +188,7 @@ func (_c *MockClient_CloudInit_Call) Return(_a0 error) *MockClient_CloudInit_Cal
 	return _c
 }
 
-func (_c *MockClient_CloudInit_Call) RunAndReturn(run func(context.Context, *go_proxmox.VirtualMachine, string, string, string, string, string, string) error) *MockClient_CloudInit_Call {
+func (_c *MockClient_CloudInit_Call) RunAndReturn(run func(context.Context, *go_proxmox.VirtualMachine, string, string, string, string, string, string, proxmox.CloudInitUploadRecorder) error) *MockClient_CloudInit_Call {
 	_c.Call.Return(run)
 	return _c
 }
@@ -323,9 +324,9 @@ func (_c *MockClient_ConfigureVM_Call) RunAndReturn(run func(context.Context, *g
 	return _c
 }
 
-// DeleteVM provides a mock function with given fields: ctx, nodeName, vmID, machineIdentity
-func (_m *MockClient) DeleteVM(ctx context.Context, nodeName string, vmID int64, machineIdentity string) (*go_proxmox.Task, error) {
-	ret := _m.Called(ctx, nodeName, vmID, machineIdentity)
+// DeleteVM provides a mock function with given fields: ctx, nodeName, vmID, machineIdentity, upload
+func (_m *MockClient) DeleteVM(ctx context.Context, nodeName string, vmID int64, machineIdentity string, upload *proxmox.CloudInitUpload) (*go_proxmox.Task, error) {
+	ret := _m.Called(ctx, nodeName, vmID, machineIdentity, upload)
 
 	if len(ret) == 0 {
 		panic("no return value specified for DeleteVM")
@@ -333,19 +334,19 @@ func (_m *MockClient) DeleteVM(ctx context.Context, nodeName string, vmID int64,
 
 	var r0 *go_proxmox.Task
 	var r1 error
-	if rf, ok := ret.Get(0).(func(context.Context, string, int64, string) (*go_proxmox.Task, error)); ok {
-		return rf(ctx, nodeName, vmID, machineIdentity)
+	if rf, ok := ret.Get(0).(func(context.Context, string, int64, string, *proxmox.CloudInitUpload) (*go_proxmox.Task, error)); ok {
+		return rf(ctx, nodeName, vmID, machineIdentity, upload)
 	}
-	if rf, ok := ret.Get(0).(func(context.Context, string, int64, string) *go_proxmox.Task); ok {
-		r0 = rf(ctx, nodeName, vmID, machineIdentity)
+	if rf, ok := ret.Get(0).(func(context.Context, string, int64, string, *proxmox.CloudInitUpload) *go_proxmox.Task); ok {
+		r0 = rf(ctx, nodeName, vmID, machineIdentity, upload)
 	} else {
 		if ret.Get(0) != nil {
 			r0 = ret.Get(0).(*go_proxmox.Task)
 		}
 	}
 
-	if rf, ok := ret.Get(1).(func(context.Context, string, int64, string) error); ok {
-		r1 = rf(ctx, nodeName, vmID, machineIdentity)
+	if rf, ok := ret.Get(1).(func(context.Context, string, int64, string, *proxmox.CloudInitUpload) error); ok {
+		r1 = rf(ctx, nodeName, vmID, machineIdentity, upload)
 	} else {
 		r1 = ret.Error(1)
 	}
@@ -363,13 +364,14 @@ type MockClient_DeleteVM_Call struct {
 //   - nodeName string
 //   - vmID int64
 //   - machineIdentity string
-func (_e *MockClient_Expecter) DeleteVM(ctx interface{}, nodeName interface{}, vmID interface{}, machineIdentity interface{}) *MockClient_DeleteVM_Call {
-	return &MockClient_DeleteVM_Call{Call: _e.mock.On("DeleteVM", ctx, nodeName, vmID, machineIdentity)}
+//   - upload *proxmox.CloudInitUpload
+func (_e *MockClient_Expecter) DeleteVM(ctx interface{}, nodeName interface{}, vmID interface{}, machineIdentity interface{}, upload interface{}) *MockClient_DeleteVM_Call {
+	return &MockClient_DeleteVM_Call{Call: _e.mock.On("DeleteVM", ctx, nodeName, vmID, machineIdentity, upload)}
 }
 
-func (_c *MockClient_DeleteVM_Call) Run(run func(ctx context.Context, nodeName string, vmID int64, machineIdentity string)) *MockClient_DeleteVM_Call {
+func (_c *MockClient_DeleteVM_Call) Run(run func(ctx context.Context, nodeName string, vmID int64, machineIdentity string, upload *proxmox.CloudInitUpload)) *MockClient_DeleteVM_Call {
 	_c.Call.Run(func(args mock.Arguments) {
-		run(args[0].(context.Context), args[1].(string), args[2].(int64), args[3].(string))
+		run(args[0].(context.Context), args[1].(string), args[2].(int64), args[3].(string), args[4].(*proxmox.CloudInitUpload))
 	})
 	return _c
 }
@@ -379,7 +381,7 @@ func (_c *MockClient_DeleteVM_Call) Return(_a0 *go_proxmox.Task, _a1 error) *Moc
 	return _c
 }
 
-func (_c *MockClient_DeleteVM_Call) RunAndReturn(run func(context.Context, string, int64, string) (*go_proxmox.Task, error)) *MockClient_DeleteVM_Call {
+func (_c *MockClient_DeleteVM_Call) RunAndReturn(run func(context.Context, string, int64, string, *proxmox.CloudInitUpload) (*go_proxmox.Task, error)) *MockClient_DeleteVM_Call {
 	_c.Call.Return(run)
 	return _c
 }

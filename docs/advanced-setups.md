@@ -229,6 +229,7 @@ For the Proxmox API user/token you create for CAPMOX, these are the minimum requ
 
 * In the SDN example, `1234` is the optional VLAN ID if you want to restrict the user to a specific VLAN.
 * CAPMOX needs `PVEDataStoreAdmin` on a storage suitable for ISO images for cloud-init. Create a dedicated storage for this (you can use subdirectories in an existing network share for example).
+  CAPMOX names each ISO from the immutable ProxmoxMachine UID and logical bootstrap digest and records the exact storage volume, size, and accepted upload task on the ProxmoxMachine before waiting for PVE. Deletion reconciles that durable record before releasing the Machine finalizer, so an upload that finishes after a controller restart or early VM removal is still removed. Ambiguous or nonterminal upload ownership fails closed rather than treating an empty storage scan as cleanup proof.
 * CAPMOX needs `AllocateSpace` permissions on a storage suitable for disc images. This can be shared with other users as it is only accessed indirectly by cloning/deleting VMs.
 
 ## Proxmox TLS communication

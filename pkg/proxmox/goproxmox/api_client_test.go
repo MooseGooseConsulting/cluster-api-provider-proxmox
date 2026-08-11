@@ -18,6 +18,7 @@ package goproxmox
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"testing"
@@ -639,7 +640,7 @@ func TestProxmoxAPIClient_DeleteVM(t *testing.T) {
 			httpmock.RegisterResponder(http.MethodGet, fmt.Sprintf(`=~/nodes/test/tasks/%s/status`, upid),
 				httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": completedTask}))
 
-			task, err := client.DeleteVM(context.Background(), test.node, test.vmID, "machine-uid")
+			task, err := client.DeleteVM(context.Background(), test.node, test.vmID, "machine-uid", nil)
 
 			if test.fails {
 				require.Error(t, err)
@@ -656,6 +657,84 @@ func TestProxmoxAPIClient_DeleteVM(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestDeleteVMWaitsForRecordedUploadThenCleansLateArtifact(t *testing.T) {
+	client := newTestClient(t)
+	uploadUPID := "UPID:test:000D6BDA:041E0A54:654A5A1D:imgcopy:local:root@pam:"
+	deleteUPID := "UPID:test:000D6BDB:041E0A55:654A5A1E:imgdel:local:root@pam:"
+	digest := cloudInitBootstrapDigest("late", "metadata", "", "network")
+	isoName := "user-data-machine-uid-" + digest + ".iso"
+	volID := "local:iso/" + isoName
+	upload := &capmox.CloudInitUpload{
+		Version: 1,
+		Node:    "test",
+		Storage: "local",
+		VolID:   volID,
+		Size:    4096,
+		UPID:    uploadUPID,
+		Phase:   capmox.CloudInitUploadPhaseAccepted,
+	}
+
+	uploadRunning := true
+	artifactPresent := false
+	deleteCalls := 0
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/test/status$`,
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": proxmox.Node{Name: "test"}}))
+	httpmock.RegisterResponder(http.MethodGet, `=~/cluster/status$`,
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": proxmox.NodeStatuses{{Name: "test"}}}))
+	httpmock.RegisterResponder(http.MethodGet, `=~/cluster/nextid$`,
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": "320"}))
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/test/tasks/`+uploadUPID+`/status$`, func(*http.Request) (*http.Response, error) {
+		task := proxmox.Task{UPID: proxmox.UPID(uploadUPID), Node: "test", Status: "running", IsRunning: true}
+		if !uploadRunning {
+			task.Status = "stopped"
+			task.ExitStatus = "OK"
+			task.IsRunning = false
+		}
+		return httpmock.NewJsonResponse(200, map[string]any{"data": task})
+	})
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/test/storage/local/status$`,
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": proxmox.Storage{Name: "local", Content: "iso", Enabled: 1}}))
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/test/storage$`,
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": &proxmox.Storages{{Name: "local", Content: "iso", Enabled: 1}}}))
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/test/storage/local/content$`, func(*http.Request) (*http.Response, error) {
+		contents := []*proxmox.StorageContent{}
+		if artifactPresent {
+			contents = append(contents, &proxmox.StorageContent{Volid: volID, Format: "iso", Size: 4096})
+		}
+		return httpmock.NewJsonResponse(200, map[string]any{"data": contents})
+	})
+	httpmock.RegisterResponder(http.MethodDelete, `=~/nodes/test/storage/local/content/.*$`, func(*http.Request) (*http.Response, error) {
+		deleteCalls++
+		artifactPresent = false
+		return httpmock.NewJsonResponse(200, map[string]any{"data": deleteUPID})
+	})
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/test/tasks/`+deleteUPID+`/status$`,
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": proxmox.Task{UPID: proxmox.UPID(deleteUPID), Node: "test", Status: "stopped", ExitStatus: "OK"}}))
+
+	originalWait := waitForCloudInitTask
+	waitForCloudInitTask = func(_ context.Context, task *proxmox.Task, _ int) error {
+		if task.IsRunning {
+			return errors.New("task still running")
+		}
+		return nil
+	}
+	t.Cleanup(func() { waitForCloudInitTask = originalWait })
+
+	_, err := client.DeleteVM(context.Background(), "test", 320, "machine-uid", upload)
+	require.ErrorContains(t, err, "is not terminal")
+	require.NotErrorIs(t, err, ErrVMIDFree, "a VM-free scan must not release ownership while the upload can still materialize")
+	require.Zero(t, deleteCalls)
+
+	// Simulate the controller having crashed after upload dispatch, the VM being
+	// removed independently, and the accepted task materializing its ISO later.
+	uploadRunning = false
+	artifactPresent = true
+	_, err = client.DeleteVM(context.Background(), "test", 320, "machine-uid", upload)
+	require.ErrorIs(t, err, ErrVMIDFree)
+	require.Equal(t, 1, deleteCalls)
+	require.False(t, artifactPresent)
 }
 
 func TestProxmoxAPIClient_GetTask(t *testing.T) {

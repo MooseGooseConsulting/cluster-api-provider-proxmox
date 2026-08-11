@@ -213,7 +213,7 @@ NEXT_VM:
 }
 
 // DeleteVM deletes a VM based on the nodeName and vmID.
-func (c *APIClient) DeleteVM(ctx context.Context, nodeName string, vmID int64, machineIdentity string) (*proxmox.Task, error) {
+func (c *APIClient) DeleteVM(ctx context.Context, nodeName string, vmID int64, machineIdentity string, upload *capmox.CloudInitUpload) (*proxmox.Task, error) {
 	// A vmID can not be lower than 100.
 	// If the provided vmID is lower (like -1 in issue #31), just error out without calling the API.
 	if vmID < 100 {
@@ -231,6 +231,9 @@ func (c *APIClient) DeleteVM(ctx context.Context, nodeName string, vmID int64, m
 	}
 
 	if vmidFree, err := cluster.CheckID(ctx, int(vmID)); vmidFree {
+		if err := c.reconcileRecordedCloudInitUpload(ctx, node, machineIdentity, upload); err != nil {
+			return nil, fmt.Errorf("cannot reconcile recorded cloud-init upload for absent vm id %d: %w", vmID, err)
+		}
 		storage, volID, cleanupErr := recoverOwnedCloudInitVolume(ctx, node, machineIdentity)
 		if cleanupErr != nil {
 			return nil, fmt.Errorf("cannot recover untagged cloud-init ISO for absent vm id %d: %w", vmID, cleanupErr)
@@ -267,6 +270,66 @@ func (c *APIClient) DeleteVM(ctx context.Context, nodeName string, vmID int64, m
 	}
 
 	return task, nil
+}
+
+func (c *APIClient) reconcileRecordedCloudInitUpload(ctx context.Context, node *proxmox.Node, machineIdentity string, upload *capmox.CloudInitUpload) error {
+	if upload == nil {
+		return nil
+	}
+	if upload.Version != 1 || upload.Node != node.Name || upload.Storage == "" || upload.Size == 0 {
+		return fmt.Errorf("invalid cloud-init upload record: version=%d node=%q storage=%q size=%d", upload.Version, upload.Node, upload.Storage, upload.Size)
+	}
+	switch upload.Phase {
+	case capmox.CloudInitUploadPhaseIntent:
+		if upload.UPID != "" {
+			return errors.New("cloud-init upload intent unexpectedly contains a task UPID")
+		}
+	case capmox.CloudInitUploadPhaseAccepted:
+		if upload.UPID == "" {
+			return errors.New("accepted cloud-init upload has no task UPID")
+		}
+	case capmox.CloudInitUploadPhaseComplete:
+	default:
+		return fmt.Errorf("invalid cloud-init upload phase %q", upload.Phase)
+	}
+	prefix := upload.Storage + ":iso/" + cloudInitStorageFilenamePrefix + machineIdentity + "-"
+	if !strings.HasPrefix(upload.VolID, prefix) || !strings.HasSuffix(upload.VolID, ".iso") {
+		return fmt.Errorf("recorded cloud-init volume %q is not owned by Machine %q on storage %q", upload.VolID, machineIdentity, upload.Storage)
+	}
+	digest := strings.TrimSuffix(strings.TrimPrefix(upload.VolID, prefix), ".iso")
+	if _, err := cloudInitISOName(machineIdentity, digest); err != nil {
+		return fmt.Errorf("invalid recorded cloud-init volume %q: %w", upload.VolID, err)
+	}
+	storage, err := node.Storage(ctx, upload.Storage)
+	if err != nil {
+		return fmt.Errorf("get recorded cloud-init storage %q: %w", upload.Storage, err)
+	}
+	if upload.UPID != "" && upload.Phase != capmox.CloudInitUploadPhaseComplete {
+		task, err := c.GetTask(ctx, upload.UPID)
+		if err != nil {
+			return fmt.Errorf("get recorded cloud-init upload task %q: %w", upload.UPID, err)
+		}
+		waitErr := waitForCloudInitTask(ctx, task, 2)
+		taskFailed := task.IsFailed || (task.ExitStatus != "" && task.ExitStatus != "OK")
+		if waitErr != nil && !taskFailed {
+			return fmt.Errorf("recorded cloud-init upload task %q is not terminal: %w", upload.UPID, waitErr)
+		}
+	}
+	isoName := strings.TrimPrefix(upload.VolID, upload.Storage+":iso/")
+	present, err := inspectCloudInitISO(ctx, storage, upload.Storage, isoName, upload.Size)
+	if err != nil {
+		return fmt.Errorf("inspect recorded cloud-init upload %q: %w", upload.VolID, err)
+	}
+	if !present {
+		if upload.Phase == capmox.CloudInitUploadPhaseIntent && upload.UPID == "" {
+			return fmt.Errorf("cloud-init upload intent for %q has no terminal task or artifact proof", upload.VolID)
+		}
+		return nil
+	}
+	if _, err := deleteOwnedCloudInitVolume(ctx, storage, upload.VolID); err != nil {
+		return fmt.Errorf("delete recorded cloud-init upload %q: %w", upload.VolID, err)
+	}
+	return nil
 }
 
 // CheckID checks if the vmid is available on the cluster.
