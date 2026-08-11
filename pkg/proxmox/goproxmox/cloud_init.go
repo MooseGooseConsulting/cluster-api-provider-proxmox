@@ -77,7 +77,14 @@ func (c *APIClient) CloudInit(ctx context.Context, vm *proxmox.VirtualMachine, m
 	if err != nil {
 		return err
 	}
-	storage, err := findCloudInitUploadTarget(ctx, node, isoName, size)
+	// The tag is the durable pre-mount ownership marker. Applying it before the
+	// upload lets deletion distinguish a clean, untagged VM from a failed
+	// provisioning attempt that may own an unattached immutable artifact.
+	if err := addCloudInitOwnershipTag(ctx, vm); err != nil {
+		return err
+	}
+
+	storage, err := findCloudInitUploadTarget(ctx, node, machineIdentity, isoName, size)
 	if err != nil {
 		return fmt.Errorf("find exact cloud-init ISO upload target on node %q: %w", vm.Node, err)
 	}
@@ -87,33 +94,51 @@ func (c *APIClient) CloudInit(ctx context.Context, vm *proxmox.VirtualMachine, m
 		return err
 	}
 	if !proven {
-		if err := uploadTask.WaitFor(ctx, 5); err != nil {
+		if err := waitForCloudInitEffect(ctx, uploadTask, 5, "cloud-init ISO upload", true, func() error {
+			return requireCloudInitISO(ctx, storage, storage.Name, isoName, size)
+		}); err != nil {
 			return err
 		}
-		if err := requireCloudInitISO(ctx, storage, storage.Name, isoName, size); err != nil {
-			return fmt.Errorf("cloud-init ISO upload completed without exact storage proof: %w", err)
-		}
 	}
 
-	if err := addCloudInitOwnershipTag(ctx, vm); err != nil {
-		return err
-	}
+	expectedVolID := fmt.Sprintf("%s:iso/%s", storage.Name, isoName)
+	return mountCloudInitISO(ctx, vm, machineIdentity, device, expectedVolID)
+}
 
-	options := cloudInitConfigOptions(vm, device, fmt.Sprintf("%s:iso/%s", storage.Name, isoName))
-	configTask, err := vm.Config(ctx, options...)
+func mountCloudInitISO(ctx context.Context, vm *proxmox.VirtualMachine, machineIdentity, device, expectedVolID string) error {
+	mounted, err := cloudInitMountIsExact(vm, machineIdentity, device, expectedVolID)
 	if err != nil {
 		return err
 	}
-	return configTask.WaitFor(ctx, 2)
+	if mounted {
+		return nil
+	}
+
+	options := cloudInitConfigOptions(vm, device, expectedVolID)
+	configTask, err := vm.Config(ctx, options...)
+	if err != nil {
+		if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+			return err
+		}
+		if proofErr := requireCloudInitMount(ctx, vm, machineIdentity, device, expectedVolID); proofErr != nil {
+			return fmt.Errorf("cloud-init mount response was ambiguous (%w) and exact config proof failed: %v", err, proofErr)
+		}
+		return nil
+	}
+	return waitForCloudInitEffect(ctx, configTask, 2, "cloud-init ISO mount", false, func() error {
+		return requireCloudInitMount(ctx, vm, machineIdentity, device, expectedVolID)
+	})
 }
 
-func findCloudInitUploadTarget(ctx context.Context, node *proxmox.Node, isoName string, size uint64) (*proxmox.Storage, error) {
+func findCloudInitUploadTarget(ctx context.Context, node *proxmox.Node, machineIdentity, isoName string, size uint64) (*proxmox.Storage, error) {
 	storages, err := node.Storages(ctx)
 	if err != nil {
 		return nil, err
 	}
 	var eligible *proxmox.Storage
 	var matched *proxmox.Storage
+	var supersededStorage *proxmox.Storage
+	var supersededVolID string
 	for _, storage := range storages {
 		if storage.Enabled != 0 && storageSupportsContent(storage.Content, cloudInitISOContentType) && eligible == nil {
 			eligible = storage
@@ -123,8 +148,23 @@ func findCloudInitUploadTarget(ctx context.Context, node *proxmox.Node, isoName 
 			return nil, fmt.Errorf("inspect storage %q before cloud-init upload: %w", storage.Name, err)
 		}
 		expectedVolID := fmt.Sprintf("%s:iso/%s", storage.Name, isoName)
+		candidate, found, err := ownedCloudInitCandidate(contents, machineIdentity)
+		if err != nil {
+			return nil, err
+		}
+		if !found {
+			continue
+		}
+		if candidate != expectedVolID {
+			if supersededStorage != nil {
+				return nil, fmt.Errorf("multiple superseded cloud-init artifacts found for Machine %q", machineIdentity)
+			}
+			supersededStorage = storage
+			supersededVolID = candidate
+			continue
+		}
 		for _, content := range contents {
-			if content.Volid != expectedVolID {
+			if content.Volid != candidate {
 				continue
 			}
 			if matched != nil {
@@ -137,6 +177,11 @@ func findCloudInitUploadTarget(ctx context.Context, node *proxmox.Node, isoName 
 				return nil, fmt.Errorf("exact cloud-init artifact %q exists on ineligible storage %q", isoName, storage.Name)
 			}
 			matched = storage
+		}
+	}
+	if supersededStorage != nil {
+		if _, err := deleteOwnedCloudInitVolume(ctx, supersededStorage, supersededVolID); err != nil {
+			return nil, fmt.Errorf("delete superseded cloud-init artifact %q: %w", supersededVolID, err)
 		}
 	}
 	if matched != nil {
@@ -159,6 +204,29 @@ func addCloudInitOwnershipTag(ctx context.Context, vm *proxmox.VirtualMachine) e
 		}
 		if err := waitForCloudInitTask(ctx, tagTask, 2); err != nil {
 			return fmt.Errorf("wait for cloud-init ownership tag: %w", err)
+		}
+	}
+	return nil
+}
+
+func waitForCloudInitEffect(ctx context.Context, task *proxmox.Task, attempts int, operation string, proveOnSuccess bool, prove func() error) error {
+	if task == nil {
+		return fmt.Errorf("%s returned no task", operation)
+	}
+	waitErr := waitForCloudInitTask(ctx, task, attempts)
+	if task.IsFailed || (task.ExitStatus != "" && task.ExitStatus != "OK") {
+		return fmt.Errorf("%s task failed with exit status %q", operation, task.ExitStatus)
+	}
+	if waitErr != nil {
+		proofErr := prove()
+		if proofErr != nil {
+			return fmt.Errorf("%s task wait was ambiguous (%w) and exact effect proof failed: %v", operation, waitErr, proofErr)
+		}
+		return nil
+	}
+	if proveOnSuccess {
+		if proofErr := prove(); proofErr != nil {
+			return fmt.Errorf("%s completed without exact effect proof: %w", operation, proofErr)
 		}
 	}
 	return nil
@@ -283,6 +351,38 @@ func cloudInitConfigOptions(vm *proxmox.VirtualMachine, device, volID string) []
 		options = append(options, proxmox.VirtualMachineOption{Name: "boot", Value: boot})
 	}
 	return options
+}
+
+func cloudInitMountIsExact(vm *proxmox.VirtualMachine, machineIdentity, device, expectedVolID string) (bool, error) {
+	if vm.VirtualMachineConfig == nil || device != "ide0" {
+		return false, fmt.Errorf("unable to prove cloud-init mount device %q", device)
+	}
+	deviceValue := vm.VirtualMachineConfig.IDE0
+	if deviceValue == "" || deviceValue == cloudInitUnmountedDeviceValue {
+		return false, nil
+	}
+	_, mountedVolID, err := ownedCloudInitVolume(deviceValue, machineIdentity)
+	if err != nil {
+		return false, err
+	}
+	if mountedVolID != expectedVolID {
+		return false, fmt.Errorf("cloud-init device mounts %q instead of exact expected volume %q", mountedVolID, expectedVolID)
+	}
+	return true, nil
+}
+
+func requireCloudInitMount(ctx context.Context, vm *proxmox.VirtualMachine, machineIdentity, device, expectedVolID string) error {
+	if err := vm.Ping(ctx); err != nil {
+		return fmt.Errorf("refetch VM config: %w", err)
+	}
+	mounted, err := cloudInitMountIsExact(vm, machineIdentity, device, expectedVolID)
+	if err != nil {
+		return err
+	}
+	if !mounted {
+		return fmt.Errorf("exact expected cloud-init volume %q is not mounted", expectedVolID)
+	}
+	return nil
 }
 
 func ownedCloudInitVolume(deviceValue, machineIdentity string) (storageName, volID string, err error) {

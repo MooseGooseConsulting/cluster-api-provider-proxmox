@@ -542,20 +542,25 @@ func TestProxmoxAPIClient_DeleteVM(t *testing.T) {
 		node               string
 		vmID               int64
 		vmFree             bool
+		tagged             bool
 		contentPresent     bool
+		storageUnavailable bool
 		wantStorageDeletes int
+		wantNoContentReads bool
 		fails              bool
 		err                string
 	}{
-		{name: "delete", node: "test", vmID: 101, contentPresent: true, wantStorageDeletes: 1},
+		{name: "delete", node: "test", vmID: 101, tagged: true, contentPresent: true, wantStorageDeletes: 1},
 		{name: "node not found", node: "enoent", vmID: 101, fails: true,
 			err: "cannot find node with name enoent: 500 Internal Server Error"},
-		{name: "delete fails", node: "test", vmID: 102, contentPresent: true, wantStorageDeletes: 1, fails: true,
+		{name: "delete fails", node: "test", vmID: 102, tagged: true, contentPresent: true, wantStorageDeletes: 1, fails: true,
 			err: "cannot delete vm with id 102: not authorized to access endpoint"},
 		{name: "absent vm removes exact immutable artifact", node: "test", vmID: 103, vmFree: true,
 			contentPresent: true, wantStorageDeletes: 1, fails: true, err: ErrVMIDFree.Error()},
 		{name: "absent vm with absent artifact is replay safe", node: "test", vmID: 104, vmFree: true,
 			contentPresent: false, wantStorageDeletes: 0, fails: true, err: ErrVMIDFree.Error()},
+		{name: "clean untagged vm deletion ignores unrelated unavailable storage", node: "test", vmID: 105,
+			storageUnavailable: true, wantNoContentReads: true},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -567,6 +572,13 @@ func TestProxmoxAPIClient_DeleteVM(t *testing.T) {
 			volID := "local:iso/user-data-machine-uid-" + logicalDigest + ".iso"
 			contentPresent := test.contentPresent
 			storageDeleteCalls := 0
+			storageContentCalls := 0
+			vmConfig := proxmox.VirtualMachineConfig{CPU: "kvm64"}
+			if test.tagged {
+				cloudInitTag := proxmox.MakeTag(proxmox.TagCloudInit)
+				vmConfig.Tags = cloudInitTag
+				vmConfig.TagsSlice = []string{cloudInitTag}
+			}
 
 			if test.vmFree {
 				httpmock.RegisterResponder(http.MethodGet, `=~/cluster/nextid`, newJSONResponder(200, fmt.Sprintf("%d", test.vmID)))
@@ -582,14 +594,20 @@ func TestProxmoxAPIClient_DeleteVM(t *testing.T) {
 				newJSONResponder(200, proxmox.VirtualMachine{Node: "test", VMID: 101}))
 			httpmock.RegisterResponder(http.MethodGet, `=~/nodes/test/qemu/102/status/current`,
 				newJSONResponder(200, proxmox.VirtualMachine{Node: "test", VMID: 102}))
+			httpmock.RegisterResponder(http.MethodGet, `=~/nodes/test/qemu/105/status/current`,
+				newJSONResponder(200, proxmox.VirtualMachine{Node: "test", VMID: 105}))
 			httpmock.RegisterResponder(http.MethodDelete, `=~/nodes/test/qemu/101`,
 				newJSONResponder(200, upid))
 			httpmock.RegisterResponder(http.MethodDelete, `=~/nodes/test/qemu/102`,
 				newJSONResponder(403, nil))
+			httpmock.RegisterResponder(http.MethodDelete, `=~/nodes/test/qemu/105`,
+				newJSONResponder(200, upid))
 			httpmock.RegisterResponder(http.MethodGet, `=~/nodes/test/qemu/101/config`,
-				newJSONResponder(200, proxmox.VirtualMachineConfig{CPU: "kvm64"}))
+				newJSONResponder(200, vmConfig))
 			httpmock.RegisterResponder(http.MethodGet, `=~/nodes/test/qemu/102/config`,
-				newJSONResponder(200, proxmox.VirtualMachineConfig{CPU: "kvm64"}))
+				newJSONResponder(200, vmConfig))
+			httpmock.RegisterResponder(http.MethodGet, `=~/nodes/test/qemu/105/config`,
+				newJSONResponder(200, vmConfig))
 			httpmock.RegisterResponder(http.MethodGet, `=~/cluster/status`,
 				newJSONResponder(200,
 					proxmox.NodeStatuses{{Name: "test"}, {Name: "test2"}}))
@@ -598,6 +616,10 @@ func TestProxmoxAPIClient_DeleteVM(t *testing.T) {
 			httpmock.RegisterResponder(http.MethodGet, `=~/nodes/test/storage$`,
 				httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": &proxmox.Storages{{Name: "local", Content: "iso", Enabled: 1}}}))
 			httpmock.RegisterResponder(http.MethodGet, `=~/nodes/test/storage/local/content`, func(*http.Request) (*http.Response, error) {
+				storageContentCalls++
+				if test.storageUnavailable {
+					return httpmock.NewJsonResponse(500, map[string]any{"data": nil})
+				}
 				contents := []*proxmox.StorageContent{}
 				if contentPresent {
 					contents = append(contents, &proxmox.StorageContent{Volid: volID, Format: "iso", Size: 4096})
@@ -605,6 +627,8 @@ func TestProxmoxAPIClient_DeleteVM(t *testing.T) {
 				return httpmock.NewJsonResponse(200, map[string]any{"data": contents})
 			})
 			httpmock.RegisterResponder(http.MethodPost, `=~/nodes/test/qemu/101/config`,
+				httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": upid}))
+			httpmock.RegisterResponder(http.MethodPost, `=~/nodes/test/qemu/102/config`,
 				httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": upid}))
 			httpmock.RegisterResponder(http.MethodDelete, `=~/nodes/test/storage/local/content/.*`, func(*http.Request) (*http.Response, error) {
 				storageDeleteCalls++
@@ -627,6 +651,9 @@ func TestProxmoxAPIClient_DeleteVM(t *testing.T) {
 			}
 			require.Equal(t, test.wantStorageDeletes, storageDeleteCalls, "deletion must remove only the exact immutable Machine ISO")
 			require.False(t, contentPresent)
+			if test.wantNoContentReads {
+				require.Zero(t, storageContentCalls, "clean untagged deletion must not require global storage absence proof")
+			}
 		})
 	}
 }

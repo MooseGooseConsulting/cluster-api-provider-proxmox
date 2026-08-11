@@ -216,6 +216,118 @@ func TestUploadCloudInitISOProof(t *testing.T) {
 	}
 }
 
+func TestWaitForCloudInitEffectRequiresExactProofAndRejectsAuthoritativeFailure(t *testing.T) {
+	originalWait := waitForCloudInitTask
+	t.Cleanup(func() { waitForCloudInitTask = originalWait })
+
+	tests := []struct {
+		name       string
+		waitErr    error
+		proofErr   error
+		taskFailed bool
+		wantError  string
+	}{
+		{name: "lost task poll accepts exact effect", waitErr: io.ErrUnexpectedEOF},
+		{name: "lost task poll without effect remains failure", waitErr: io.EOF, proofErr: errors.New("exact artifact absent"), wantError: "exact effect proof failed"},
+		{name: "authoritative task failure overrides exact effect", taskFailed: true, wantError: "task failed with exit status"},
+		{name: "successful task without effect remains failure", proofErr: errors.New("exact artifact absent"), wantError: "completed without exact effect proof"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			proofCalls := 0
+			waitForCloudInitTask = func(_ context.Context, task *proxmox.Task, _ int) error {
+				if test.taskFailed {
+					task.IsFailed = true
+					task.ExitStatus = "storage error"
+				}
+				return test.waitErr
+			}
+			err := waitForCloudInitEffect(context.Background(), &proxmox.Task{}, 2, "test operation", true, func() error {
+				proofCalls++
+				return test.proofErr
+			})
+			if test.wantError == "" {
+				require.NoError(t, err)
+			} else {
+				require.ErrorContains(t, err, test.wantError)
+			}
+			if test.taskFailed {
+				require.Zero(t, proofCalls, "authoritative task failure must not be overridden by readback")
+			} else {
+				require.Equal(t, 1, proofCalls)
+			}
+		})
+	}
+}
+
+func TestMountCloudInitISORecoversOnlyExactPostDispatchState(t *testing.T) {
+	originalWait := waitForCloudInitTask
+	t.Cleanup(func() { waitForCloudInitTask = originalWait })
+	digest := strings.Repeat("a", cloudInitDigestLength)
+	expectedVolID := "local:iso/user-data-machine-uid-" + digest + ".iso"
+	upid := proxmox.UPID("UPID:pve:003B4235:1DF4ABCA:667C1C45:qmconfig:320:root@pam:")
+
+	tests := []struct {
+		name             string
+		initialMount     string
+		postErr          error
+		waitErr          error
+		taskFailed       bool
+		readbackMount    string
+		wantError        string
+		wantConfigCalls  int
+		wantReadbackGets int
+	}{
+		{name: "preexisting exact mount is replay safe", initialMount: expectedVolID + ",media=cdrom,size=4M", wantConfigCalls: 0},
+		{name: "lost config response accepts exact readback", postErr: io.EOF, readbackMount: expectedVolID + ",media=cdrom,size=4M", wantConfigCalls: 1, wantReadbackGets: 1},
+		{name: "lost config response rejects absent readback", postErr: io.ErrUnexpectedEOF, wantError: "exact config proof failed", wantConfigCalls: 1, wantReadbackGets: 1},
+		{name: "lost task poll accepts exact readback", waitErr: io.ErrUnexpectedEOF, readbackMount: expectedVolID + ",media=cdrom", wantConfigCalls: 1, wantReadbackGets: 1},
+		{name: "lost task poll rejects foreign readback", waitErr: io.EOF, readbackMount: "local:iso/foreign.iso,media=cdrom", wantError: "exact effect proof failed", wantConfigCalls: 1, wantReadbackGets: 1},
+		{name: "authoritative task failure overrides exact readback", taskFailed: true, readbackMount: expectedVolID + ",media=cdrom", wantError: "task failed with exit status", wantConfigCalls: 1},
+		{name: "authoritative config rejection remains failure", postErr: errors.New("500 Internal Server Error"), readbackMount: expectedVolID + ",media=cdrom", wantError: "500 Internal Server Error", wantConfigCalls: 1},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			client := newTestClient(t)
+			vm := &proxmox.VirtualMachine{VirtualMachineConfig: &proxmox.VirtualMachineConfig{IDE0: test.initialMount}}
+			vm.New(client.Client, "pve", 320)
+			configCalls := 0
+			readbackGets := 0
+			httpmock.RegisterResponder(http.MethodPost, `=~/nodes/pve/qemu/320/config$`, func(*http.Request) (*http.Response, error) {
+				configCalls++
+				if test.postErr != nil {
+					return nil, test.postErr
+				}
+				return httpmock.NewJsonResponse(200, map[string]any{"data": upid})
+			})
+			httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve/qemu/320/status/current$`,
+				httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": proxmox.VirtualMachine{Node: "pve", VMID: 320}}))
+			httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve/qemu/320/config$`, func(*http.Request) (*http.Response, error) {
+				readbackGets++
+				return httpmock.NewJsonResponse(200, map[string]any{"data": proxmox.VirtualMachineConfig{IDE0: test.readbackMount}})
+			})
+			waitForCloudInitTask = func(_ context.Context, task *proxmox.Task, _ int) error {
+				if test.taskFailed {
+					task.IsFailed = true
+					task.ExitStatus = "mount failed"
+				}
+				return test.waitErr
+			}
+
+			err := mountCloudInitISO(context.Background(), vm, "machine-uid", "ide0", expectedVolID)
+			if test.wantError == "" {
+				require.NoError(t, err)
+			} else {
+				require.ErrorContains(t, err, test.wantError)
+			}
+			require.Equal(t, test.wantConfigCalls, configCalls)
+			require.Equal(t, test.wantReadbackGets, readbackGets)
+		})
+	}
+}
+
 func TestAppendBootDevice(t *testing.T) {
 	require.Equal(t, "order=scsi0;net0;ide0", appendBootDevice("order=scsi0;net0", "ide0"))
 	require.Equal(t, "order=scsi0;ide0", appendBootDevice("order=scsi0;ide0", "ide0"))
@@ -245,17 +357,23 @@ func TestCloudInitOwnershipTagTaskFailureBlocksContinuation(t *testing.T) {
 
 	upid := proxmox.UPID("UPID:pve:003B4235:1DF4ABCA:667C1C45:qmconfig:320:root@pam:")
 	configCalls := 0
+	storageCalls := 0
 	httpmock.RegisterResponder(http.MethodPost, `=~/nodes/pve/qemu/320/config$`, func(*http.Request) (*http.Response, error) {
 		configCalls++
 		return httpmock.NewJsonResponse(200, map[string]any{"data": upid})
+	})
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve/storage$`, func(*http.Request) (*http.Response, error) {
+		storageCalls++
+		return httpmock.NewJsonResponse(200, map[string]any{"data": &proxmox.Storages{{Name: "local", Content: "iso", Enabled: 1}}})
 	})
 	originalWait := waitForCloudInitTask
 	t.Cleanup(func() { waitForCloudInitTask = originalWait })
 	waitForCloudInitTask = func(context.Context, *proxmox.Task, int) error { return errors.New("tag task failed") }
 
-	err = addCloudInitOwnershipTag(context.Background(), vm)
+	err = client.CloudInit(context.Background(), vm, "machine-uid", "ide0", "user-data", "meta-data", "", "network-data")
 	require.ErrorContains(t, err, "wait for cloud-init ownership tag")
-	require.Equal(t, 1, configCalls, "failed ownership task must not advance to a mount config")
+	require.Equal(t, 1, configCalls, "failed ownership task must not advance to upload or mount config")
+	require.Zero(t, storageCalls, "ownership marker must be durable before storage discovery or upload")
 }
 
 func TestOwnedCloudInitVolume(t *testing.T) {
@@ -543,6 +661,8 @@ func TestCloudInitRecoveredUploadTagsMountsAndPreservesBoot(t *testing.T) {
 		if config["ide0"] != "" {
 			mounted = config["ide0"]
 			boot = config["boot"]
+			vmFixture.VirtualMachineConfig.IDE0 = mounted
+			vmFixture.VirtualMachineConfig.Boot = boot
 		}
 		return httpmock.NewJsonResponse(200, map[string]any{"data": upid})
 	})
@@ -614,9 +734,75 @@ func TestFindCloudInitUploadTargetReusesExactArtifactAcrossStorageOrderDrift(t *
 			Volid: "original:iso/" + isoName, Format: "iso", Size: 4096,
 		}}}))
 
-	storage, err := findCloudInitUploadTarget(context.Background(), node, isoName, 4096)
+	storage, err := findCloudInitUploadTarget(context.Background(), node, "machine-uid", isoName, 4096)
 	require.NoError(t, err)
 	require.Equal(t, "original", storage.Name, "retry must reuse the existing exact artifact rather than the new first eligible storage")
+}
+
+func TestFindCloudInitUploadTargetDeletesOneSupersededMachineArtifactBeforeUpload(t *testing.T) {
+	client := newTestClient(t)
+	oldDigest := strings.Repeat("a", cloudInitDigestLength)
+	newDigest := strings.Repeat("b", cloudInitDigestLength)
+	oldName, err := cloudInitISOName("machine-uid", oldDigest)
+	require.NoError(t, err)
+	newName, err := cloudInitISOName("machine-uid", newDigest)
+	require.NoError(t, err)
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve/status$`,
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": proxmox.Node{Name: "pve"}}))
+	node, err := client.Node(context.Background(), "pve")
+	require.NoError(t, err)
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve/storage$`,
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": &proxmox.Storages{{Name: "local", Content: "iso", Enabled: 1}}}))
+	oldPresent := true
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve/storage/local/content$`, func(*http.Request) (*http.Response, error) {
+		contents := []*proxmox.StorageContent{}
+		if oldPresent {
+			contents = append(contents, &proxmox.StorageContent{Volid: "local:iso/" + oldName, Format: "iso", Size: 4096})
+		}
+		return httpmock.NewJsonResponse(200, map[string]any{"data": contents})
+	})
+	upid := proxmox.UPID("UPID:pve:003B4235:1DF4ABCA:667C1C45:imgdel:320:root@pam:")
+	deleteCalls := 0
+	httpmock.RegisterResponder(http.MethodDelete, `=~/nodes/pve/storage/local/content/.*$`, func(*http.Request) (*http.Response, error) {
+		deleteCalls++
+		oldPresent = false
+		return httpmock.NewJsonResponse(200, map[string]any{"data": upid})
+	})
+	httpmock.RegisterResponder(http.MethodGet, fmt.Sprintf(`=~/nodes/pve/tasks/%s/status$`, string(upid)),
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": proxmox.Task{UPID: upid, Status: "stopped", ExitStatus: "OK"}}))
+
+	storage, err := findCloudInitUploadTarget(context.Background(), node, "machine-uid", newName, 8192)
+	require.NoError(t, err)
+	require.Equal(t, "local", storage.Name)
+	require.Equal(t, 1, deleteCalls, "changed bootstrap must reconcile the sole superseded immutable artifact before upload")
+	require.False(t, oldPresent)
+}
+
+func TestFindCloudInitUploadTargetRejectsMultipleSupersededMachineArtifacts(t *testing.T) {
+	client := newTestClient(t)
+	oldNameA, err := cloudInitISOName("machine-uid", strings.Repeat("a", cloudInitDigestLength))
+	require.NoError(t, err)
+	oldNameB, err := cloudInitISOName("machine-uid", strings.Repeat("b", cloudInitDigestLength))
+	require.NoError(t, err)
+	newName, err := cloudInitISOName("machine-uid", strings.Repeat("c", cloudInitDigestLength))
+	require.NoError(t, err)
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve/status$`,
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": proxmox.Node{Name: "pve"}}))
+	node, err := client.Node(context.Background(), "pve")
+	require.NoError(t, err)
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve/storage$`,
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": &proxmox.Storages{
+			{Name: "local", Content: "iso", Enabled: 1},
+			{Name: "other", Content: "iso", Enabled: 1},
+		}}))
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve/storage/local/content$`,
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": []*proxmox.StorageContent{{Volid: "local:iso/" + oldNameA, Format: "iso", Size: 4096}}}))
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve/storage/other/content$`,
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": []*proxmox.StorageContent{{Volid: "other:iso/" + oldNameB, Format: "iso", Size: 4096}}}))
+
+	_, err = findCloudInitUploadTarget(context.Background(), node, "machine-uid", newName, 8192)
+	require.ErrorContains(t, err, "multiple superseded")
+	require.Zero(t, httpmock.GetCallCountInfo()["DELETE =~/nodes/pve/storage/local/content/.*"], "ambiguous ownership must fail before deletion")
 }
 
 func TestRecoverOwnedCloudInitVolumeRetainsStateWhenStorageCannotBeInspected(t *testing.T) {
