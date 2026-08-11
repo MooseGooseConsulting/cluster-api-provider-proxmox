@@ -10,16 +10,48 @@ on:
 
   pull_request:
 
-  workflow_dispatch:
-
 permissions:
   contents: read
-  packages: write
 
 jobs:
-  image:
+  build:
+    if: github.event_name == 'pull_request'
     name: build image
     runs-on: "ubuntu-latest"
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Generate lowercase repository name
+        run: |
+          echo "REPO=${GITHUB_REPOSITORY,,}" >> "${GITHUB_ENV}"
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9 # v6.1.0
+        with:
+          images: ghcr.io/${{ env.REPO }}
+          tags: |
+            type=sha,prefix=sha-,format=long
+            type=ref,event=branch
+            type=ref,event=tag
+
+      - name: Build Docker image
+        id: build
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: .
+          load: true
+          push: false
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+  publish:
+    if: github.event_name == 'push'
+    name: publish image
+    runs-on: "ubuntu-latest"
+    permissions:
+      contents: read
+      packages: write
     outputs:
       digest: ${{ steps.build.outputs.digest }}
     steps:
@@ -40,7 +72,6 @@ jobs:
             type=ref,event=tag
 
       - name: Login to GitHub Container Registry
-        if: github.event_name != 'pull_request'
         uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
         with:
           registry: ghcr.io
@@ -52,11 +83,9 @@ jobs:
         uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
         with:
           context: .
-          load: ${{ github.event_name == 'pull_request' }}
-          push: ${{ github.event_name != 'pull_request' }}
+          push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
 
-      - name: Publish immutable image digest
-        if: github.event_name != 'pull_request'
+      - name: Publish image manifest digest
         run: echo "ghcr.io/${REPO}@${{ steps.build.outputs.digest }}" | tee -a "$GITHUB_STEP_SUMMARY"
