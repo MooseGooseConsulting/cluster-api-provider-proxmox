@@ -390,6 +390,158 @@ func TestMountCloudInitISORecoversOnlyExactPostDispatchState(t *testing.T) {
 	}
 }
 
+func TestValidateCloudInitTargetDeviceAcceptsOnlySameVMCanonicalPlaceholder(t *testing.T) {
+	tests := []struct {
+		name        string
+		device      string
+		deviceValue string
+		wantError   bool
+	}{
+		{name: "canonical placeholder", device: cloudInitDevice, deviceValue: "fast:vm-320-cloudinit,media=cdrom"},
+		{name: "canonical placeholder with normalized size", device: cloudInitDevice, deviceValue: "fast:vm-320-cloudinit,media=cdrom,size=4M"},
+		{name: "wrong device", device: "ide1", deviceValue: "fast:vm-320-cloudinit,media=cdrom", wantError: true},
+		{name: "cross vm", device: cloudInitDevice, deviceValue: "fast:vm-321-cloudinit,media=cdrom", wantError: true},
+		{name: "arbitrary name", device: cloudInitDevice, deviceValue: "fast:vm-320-operator,media=cdrom", wantError: true},
+		{name: "wrong media", device: cloudInitDevice, deviceValue: "fast:vm-320-cloudinit,media=disk", wantError: true},
+		{name: "missing media", device: cloudInitDevice, deviceValue: "fast:vm-320-cloudinit,size=4M", wantError: true},
+		{name: "extra option", device: cloudInitDevice, deviceValue: "fast:vm-320-cloudinit,media=cdrom,serial=unsafe", wantError: true},
+		{name: "duplicate media", device: cloudInitDevice, deviceValue: "fast:vm-320-cloudinit,media=cdrom,media=cdrom", wantError: true},
+		{name: "duplicate size", device: cloudInitDevice, deviceValue: "fast:vm-320-cloudinit,media=cdrom,size=4M,size=4M", wantError: true},
+		{name: "malformed size", device: cloudInitDevice, deviceValue: "fast:vm-320-cloudinit,media=cdrom,size=4MB", wantError: true},
+		{name: "unsafe storage", device: cloudInitDevice, deviceValue: "../fast:vm-320-cloudinit,media=cdrom", wantError: true},
+		{name: "iso path identity", device: cloudInitDevice, deviceValue: "fast:iso/vm-320-cloudinit,media=cdrom", wantError: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			vm := &proxmox.VirtualMachine{VMID: 320, VirtualMachineConfig: &proxmox.VirtualMachineConfig{IDE0: test.deviceValue}}
+			err := validateCloudInitTargetDevice(vm, "machine-uid", test.device)
+			if test.wantError {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+		})
+	}
+}
+
+func TestMountReplacesCanonicalPlaceholderAndCleanupDeletesOnlyOwnedISO(t *testing.T) {
+	client := newTestClient(t)
+	digest := strings.Repeat("a", cloudInitDigestLength)
+	ownedVolID := "fast:iso/user-data-machine-uid-" + digest + ".iso"
+	foreignVolID := "fast:iso/operator-owned.iso"
+	placeholder := "fast:vm-320-cloudinit,media=cdrom,size=4M"
+	cloudInitTag := proxmox.MakeTag(proxmox.TagCloudInit)
+	vmConfig := &proxmox.VirtualMachineConfig{
+		IDE0: placeholder, Boot: "order=scsi0;ide2", Tags: cloudInitTag, TagsSlice: []string{cloudInitTag},
+	}
+	vm := &proxmox.VirtualMachine{Node: "pve", VMID: 320, VirtualMachineConfig: vmConfig}
+	vm.New(client.Client, "pve", 320)
+	upid := proxmox.UPID("UPID:pve:1:2:3:qmconfig:320:root@pam:")
+	mountCalls := 0
+	unmountCalls := 0
+	httpmock.RegisterResponder(http.MethodPost, `=~/nodes/pve/qemu/320/config$`, func(request *http.Request) (*http.Response, error) {
+		config := map[string]string{}
+		require.NoError(t, json.NewDecoder(request.Body).Decode(&config))
+		if value, ok := config[cloudInitDevice]; ok {
+			vmConfig.IDE0 = value
+			if value == cloudInitUnmountedDeviceValue {
+				unmountCalls++
+			} else {
+				mountCalls++
+			}
+		}
+		if value, ok := config["boot"]; ok {
+			vmConfig.Boot = value
+		}
+		return httpmock.NewJsonResponse(200, map[string]any{"data": upid})
+	})
+	originalWait := waitForCloudInitTask
+	waitForCloudInitTask = func(context.Context, *proxmox.Task, int) error { return nil }
+	t.Cleanup(func() { waitForCloudInitTask = originalWait })
+
+	require.NoError(t, mountCloudInitISO(context.Background(), vm, "machine-uid", cloudInitDevice, ownedVolID))
+	require.Equal(t, 1, mountCalls)
+	require.Equal(t, ownedVolID+",media=cdrom", vmConfig.IDE0)
+	require.Equal(t, "order=scsi0;ide2;ide0", vmConfig.Boot)
+	mounted, err := cloudInitMountIsExact(vm, "machine-uid", cloudInitDevice, ownedVolID)
+	require.NoError(t, err)
+	require.True(t, mounted)
+
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve/status$`,
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": proxmox.Node{Name: "pve"}}))
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve/storage/fast/status$`,
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": proxmox.Storage{Name: "fast", Content: "iso", Enabled: 1}}))
+	ownedPresent := true
+	foreignPresent := true
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve/storage/fast/content$`, func(*http.Request) (*http.Response, error) {
+		contents := []*proxmox.StorageContent{{Volid: foreignVolID, Format: "iso", Size: 4096}}
+		if ownedPresent {
+			contents = append(contents, &proxmox.StorageContent{Volid: ownedVolID, Format: "iso", Size: 4096})
+		}
+		return httpmock.NewJsonResponse(200, map[string]any{"data": contents})
+	})
+	deleteCalls := 0
+	httpmock.RegisterResponder(http.MethodDelete, `=~/nodes/pve/storage/fast/content/.*$`, func(request *http.Request) (*http.Response, error) {
+		deleteCalls++
+		require.Contains(t, request.URL.EscapedPath(), "user-data-machine-uid-"+digest+".iso")
+		require.NotContains(t, request.URL.EscapedPath(), "operator-owned.iso")
+		ownedPresent = false
+		return httpmock.NewJsonResponse(200, map[string]any{"data": upid})
+	})
+
+	require.NoError(t, client.UnmountCloudInitISO(context.Background(), vm, "machine-uid", cloudInitDevice))
+	require.Equal(t, 1, unmountCalls)
+	require.Equal(t, 1, deleteCalls)
+	require.False(t, ownedPresent)
+	require.True(t, foreignPresent)
+}
+
+func TestSupersededUploadReconciliationTreatsCanonicalPlaceholderAsUnattached(t *testing.T) {
+	client := newTestClient(t)
+	oldDigest := strings.Repeat("a", cloudInitDigestLength)
+	newDigest := strings.Repeat("b", cloudInitDigestLength)
+	oldVolID := "fast:iso/user-data-machine-uid-" + oldDigest + ".iso"
+	newVolID := "fast:iso/user-data-machine-uid-" + newDigest + ".iso"
+	placeholder := "fast:vm-320-cloudinit,media=cdrom,size=4M"
+	vm := &proxmox.VirtualMachine{Node: "pve", VMID: 320, VirtualMachineConfig: &proxmox.VirtualMachineConfig{IDE0: placeholder}}
+	vm.New(client.Client, "pve", 320)
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve/status$`,
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": proxmox.Node{Name: "pve"}}))
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve/storage/fast/status$`,
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": proxmox.Storage{Name: "fast", Content: "iso", Enabled: 1}}))
+	node, err := client.Node(context.Background(), "pve")
+	require.NoError(t, err)
+	storage, err := node.Storage(context.Background(), "fast")
+	require.NoError(t, err)
+	upid := proxmox.UPID("UPID:pve:1:2:3:imgdel:fast:root@pam:")
+	deleteCalls := 0
+	oldPresent := true
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve/storage/fast/content$`, func(*http.Request) (*http.Response, error) {
+		contents := []*proxmox.StorageContent{}
+		if oldPresent {
+			contents = append(contents, &proxmox.StorageContent{Volid: oldVolID, Format: "iso", Size: 4096})
+		}
+		return httpmock.NewJsonResponse(200, map[string]any{"data": contents})
+	})
+	httpmock.RegisterResponder(http.MethodDelete, `=~/nodes/pve/storage/fast/content/.*$`, func(request *http.Request) (*http.Response, error) {
+		deleteCalls++
+		require.Contains(t, request.URL.EscapedPath(), "user-data-machine-uid-"+oldDigest+".iso")
+		require.NotContains(t, request.URL.EscapedPath(), newDigest)
+		oldPresent = false
+		return httpmock.NewJsonResponse(200, map[string]any{"data": upid})
+	})
+	originalWait := waitForCloudInitTask
+	waitForCloudInitTask = func(context.Context, *proxmox.Task, int) error { return nil }
+	t.Cleanup(func() { waitForCloudInitTask = originalWait })
+
+	require.NoError(t, client.reconcileSupersededCloudInitArtifact(
+		context.Background(), vm, "machine-uid", cloudInitDevice, newVolID, storage, oldVolID,
+	))
+	require.Equal(t, 1, deleteCalls)
+	require.False(t, oldPresent)
+	require.Equal(t, placeholder, vm.VirtualMachineConfig.IDE0, "superseded cleanup must preserve the verified placeholder for the new mount")
+}
+
 func TestAppendBootDevice(t *testing.T) {
 	require.Equal(t, "order=scsi0;net0;ide0", appendBootDevice("order=scsi0;net0", "ide0"))
 	require.Equal(t, "order=scsi0;ide0", appendBootDevice("order=scsi0;ide0", "ide0"))
