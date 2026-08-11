@@ -139,17 +139,17 @@ func (_c *MockClient_CloneVM_Call) RunAndReturn(run func(context.Context, int, p
 	return _c
 }
 
-// CloudInit provides a mock function with given fields: ctx, vm, device, userdata, metadata, vendordata, networkconfig
-func (_m *MockClient) CloudInit(ctx context.Context, vm *go_proxmox.VirtualMachine, device string, userdata string, metadata string, vendordata string, networkconfig string) error {
-	ret := _m.Called(ctx, vm, device, userdata, metadata, vendordata, networkconfig)
+// CloudInit provides a mock function with given fields: ctx, vm, machineIdentity, device, userdata, metadata, vendordata, networkconfig
+func (_m *MockClient) CloudInit(ctx context.Context, vm *go_proxmox.VirtualMachine, machineIdentity string, device string, userdata string, metadata string, vendordata string, networkconfig string) error {
+	ret := _m.Called(ctx, vm, machineIdentity, device, userdata, metadata, vendordata, networkconfig)
 
 	if len(ret) == 0 {
 		panic("no return value specified for CloudInit")
 	}
 
 	var r0 error
-	if rf, ok := ret.Get(0).(func(context.Context, *go_proxmox.VirtualMachine, string, string, string, string, string) error); ok {
-		r0 = rf(ctx, vm, device, userdata, metadata, vendordata, networkconfig)
+	if rf, ok := ret.Get(0).(func(context.Context, *go_proxmox.VirtualMachine, string, string, string, string, string, string) error); ok {
+		r0 = rf(ctx, vm, machineIdentity, device, userdata, metadata, vendordata, networkconfig)
 	} else {
 		r0 = ret.Error(0)
 	}
@@ -165,18 +165,19 @@ type MockClient_CloudInit_Call struct {
 // CloudInit is a helper method to define mock.On call
 //   - ctx context.Context
 //   - vm *go_proxmox.VirtualMachine
+//   - machineIdentity string
 //   - device string
 //   - userdata string
 //   - metadata string
 //   - vendordata string
 //   - networkconfig string
-func (_e *MockClient_Expecter) CloudInit(ctx interface{}, vm interface{}, device interface{}, userdata interface{}, metadata interface{}, vendordata interface{}, networkconfig interface{}) *MockClient_CloudInit_Call {
-	return &MockClient_CloudInit_Call{Call: _e.mock.On("CloudInit", ctx, vm, device, userdata, metadata, vendordata, networkconfig)}
+func (_e *MockClient_Expecter) CloudInit(ctx interface{}, vm interface{}, machineIdentity interface{}, device interface{}, userdata interface{}, metadata interface{}, vendordata interface{}, networkconfig interface{}) *MockClient_CloudInit_Call {
+	return &MockClient_CloudInit_Call{Call: _e.mock.On("CloudInit", ctx, vm, machineIdentity, device, userdata, metadata, vendordata, networkconfig)}
 }
 
-func (_c *MockClient_CloudInit_Call) Run(run func(ctx context.Context, vm *go_proxmox.VirtualMachine, device string, userdata string, metadata string, vendordata string, networkconfig string)) *MockClient_CloudInit_Call {
+func (_c *MockClient_CloudInit_Call) Run(run func(ctx context.Context, vm *go_proxmox.VirtualMachine, machineIdentity string, device string, userdata string, metadata string, vendordata string, networkconfig string)) *MockClient_CloudInit_Call {
 	_c.Call.Run(func(args mock.Arguments) {
-		run(args[0].(context.Context), args[1].(*go_proxmox.VirtualMachine), args[2].(string), args[3].(string), args[4].(string), args[5].(string), args[6].(string))
+		run(args[0].(context.Context), args[1].(*go_proxmox.VirtualMachine), args[2].(string), args[3].(string), args[4].(string), args[5].(string), args[6].(string), args[7].(string))
 	})
 	return _c
 }
@@ -186,7 +187,7 @@ func (_c *MockClient_CloudInit_Call) Return(_a0 error) *MockClient_CloudInit_Cal
 	return _c
 }
 
-func (_c *MockClient_CloudInit_Call) RunAndReturn(run func(context.Context, *go_proxmox.VirtualMachine, string, string, string, string, string) error) *MockClient_CloudInit_Call {
+func (_c *MockClient_CloudInit_Call) RunAndReturn(run func(context.Context, *go_proxmox.VirtualMachine, string, string, string, string, string, string) error) *MockClient_CloudInit_Call {
 	_c.Call.Return(run)
 	return _c
 }

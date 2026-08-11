@@ -28,7 +28,7 @@ type Client interface {
 	CloneVM(ctx context.Context, templateID int, clone VMCloneRequest) (VMCloneResponse, error)
 
 	ConfigureVM(ctx context.Context, vm *proxmox.VirtualMachine, options ...VirtualMachineOption) (*proxmox.Task, error)
-	CloudInit(ctx context.Context, vm *proxmox.VirtualMachine, device, userdata, metadata, vendordata, networkconfig string) error
+	CloudInit(ctx context.Context, vm *proxmox.VirtualMachine, machineIdentity, device, userdata, metadata, vendordata, networkconfig string) error
 
 	FindVMResource(ctx context.Context, vmID uint64) (*proxmox.ClusterResource, error)
 	FindVMTemplateByTags(ctx context.Context, templateTags []string, resolutionPolicy string) (string, int32, error)

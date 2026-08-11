@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 
 	"github.com/diskfs/go-diskfs/backend/file"
 	"github.com/diskfs/go-diskfs/filesystem/iso9660"
@@ -31,8 +32,11 @@ import (
 )
 
 const (
-	cloudInitISOBlockSize        = 2048
-	cloudInitISOVolumeIdentifier = "cidata"
+	cloudInitISOBlockSize          = 2048
+	cloudInitISOVolumeIdentifier   = "cidata"
+	cloudInitDigestLength          = sha256.Size * 2
+	maxPVEStorageFilenameLength    = 255
+	cloudInitStorageFilenamePrefix = "user-data-"
 )
 
 type cloudInitStorage interface {
@@ -40,11 +44,10 @@ type cloudInitStorage interface {
 	GetContent(ctx context.Context) ([]*proxmox.StorageContent, error)
 }
 
-// CloudInit uploads and mounts a cloud-init ISO. PVE verifies the request body
-// checksum. If the response is lost after dispatch, exact storage metadata is
-// required before reconciliation may continue.
-func (c *APIClient) CloudInit(ctx context.Context, vm *proxmox.VirtualMachine, device, userdata, metadata, vendordata, networkconfig string) error {
-	isoName := fmt.Sprintf(proxmox.UserDataISOFormat, vm.VMID)
+// CloudInit uploads and mounts a cloud-init ISO. The storage filename binds
+// the immutable ProxmoxMachine UID to the full payload digest. This makes an
+// exact pre-existing object safe restart state even when PVE reuses a VMID.
+func (c *APIClient) CloudInit(ctx context.Context, vm *proxmox.VirtualMachine, machineIdentity, device, userdata, metadata, vendordata, networkconfig string) error {
 	isoPath, err := makeCloudInitISO(userdata, metadata, vendordata, networkconfig)
 	if err != nil {
 		return err
@@ -54,6 +57,10 @@ func (c *APIClient) CloudInit(ctx context.Context, vm *proxmox.VirtualMachine, d
 	digest, size, err := fileSHA256(isoPath)
 	if err != nil {
 		return fmt.Errorf("hash cloud-init ISO: %w", err)
+	}
+	isoName, err := cloudInitISOName(machineIdentity, digest)
+	if err != nil {
+		return err
 	}
 
 	node, err := c.Client.Node(ctx, vm.Node)
@@ -65,13 +72,16 @@ func (c *APIClient) CloudInit(ctx context.Context, vm *proxmox.VirtualMachine, d
 		return err
 	}
 
-	uploadTask, recovered, err := uploadCloudInitISO(ctx, storage, storage.Name, isoPath, isoName, digest, size)
+	uploadTask, proven, err := uploadCloudInitISO(ctx, storage, storage.Name, isoPath, isoName, digest, size)
 	if err != nil {
 		return err
 	}
-	if !recovered {
+	if !proven {
 		if err := uploadTask.WaitFor(ctx, 5); err != nil {
 			return err
+		}
+		if err := requireCloudInitISO(ctx, storage, storage.Name, isoName, size); err != nil {
+			return fmt.Errorf("cloud-init ISO upload completed without exact storage proof: %w", err)
 		}
 	}
 
@@ -79,17 +89,50 @@ func (c *APIClient) CloudInit(ctx context.Context, vm *proxmox.VirtualMachine, d
 		return err
 	}
 
-	configTask, err := vm.Config(ctx, proxmox.VirtualMachineOption{
-		Name:  device,
-		Value: fmt.Sprintf("%s:iso/%s,media=cdrom", storage.Name, isoName),
-	})
+	boot := appendBootDevice(vmBootOrder(vm), device)
+	configTask, err := vm.Config(ctx,
+		proxmox.VirtualMachineOption{Name: device, Value: fmt.Sprintf("%s:iso/%s,media=cdrom", storage.Name, isoName)},
+		proxmox.VirtualMachineOption{Name: "boot", Value: boot},
+	)
 	if err != nil {
 		return err
 	}
 	return configTask.WaitFor(ctx, 2)
 }
 
+func cloudInitISOName(machineIdentity, digest string) (string, error) {
+	if machineIdentity == "" {
+		return "", errors.New("cloud-init machine identity is empty")
+	}
+	for _, char := range machineIdentity {
+		if (char < 'a' || char > 'z') && (char < '0' || char > '9') && char != '-' {
+			return "", fmt.Errorf("cloud-init machine identity %q is not a safe PVE filename component", machineIdentity)
+		}
+	}
+	if len(digest) != cloudInitDigestLength {
+		return "", fmt.Errorf("cloud-init digest must be %d lowercase hexadecimal characters", cloudInitDigestLength)
+	}
+	for _, char := range digest {
+		if (char < 'a' || char > 'f') && (char < '0' || char > '9') {
+			return "", fmt.Errorf("cloud-init digest must be %d lowercase hexadecimal characters", cloudInitDigestLength)
+		}
+	}
+	name := cloudInitStorageFilenamePrefix + machineIdentity + "-" + digest + ".iso"
+	if len(name) > maxPVEStorageFilenameLength {
+		return "", fmt.Errorf("cloud-init ISO filename length %d exceeds PVE limit %d", len(name), maxPVEStorageFilenameLength)
+	}
+	return name, nil
+}
+
 func uploadCloudInitISO(ctx context.Context, storage cloudInitStorage, storageName, isoPath, isoName, digest string, size uint64) (*proxmox.Task, bool, error) {
+	present, err := inspectCloudInitISO(ctx, storage, storageName, isoName, size)
+	if err != nil {
+		return nil, false, fmt.Errorf("cloud-init ISO preflight failed: %w", err)
+	}
+	if present {
+		return nil, true, nil
+	}
+
 	task, err := storage.UploadWithHash("iso", isoPath, &isoName, digest, "sha256")
 	if err == nil {
 		return task, false, nil
@@ -98,9 +141,27 @@ func uploadCloudInitISO(ctx context.Context, storage cloudInitStorage, storageNa
 		return nil, false, err
 	}
 
-	contents, proofErr := storage.GetContent(ctx)
-	if proofErr != nil {
+	if proofErr := requireCloudInitISO(ctx, storage, storageName, isoName, size); proofErr != nil {
 		return nil, false, fmt.Errorf("cloud-init ISO upload response was ambiguous (%w) and storage proof failed: %v", err, proofErr)
+	}
+	return nil, true, nil
+}
+
+func requireCloudInitISO(ctx context.Context, storage cloudInitStorage, storageName, isoName string, size uint64) error {
+	present, err := inspectCloudInitISO(ctx, storage, storageName, isoName, size)
+	if err != nil {
+		return err
+	}
+	if !present {
+		return fmt.Errorf("exact volume %q is absent", fmt.Sprintf("%s:iso/%s", storageName, isoName))
+	}
+	return nil
+}
+
+func inspectCloudInitISO(ctx context.Context, storage cloudInitStorage, storageName, isoName string, size uint64) (bool, error) {
+	contents, err := storage.GetContent(ctx)
+	if err != nil {
+		return false, err
 	}
 	expectedVolID := fmt.Sprintf("%s:iso/%s", storageName, isoName)
 	var matched *proxmox.StorageContent
@@ -109,18 +170,36 @@ func uploadCloudInitISO(ctx context.Context, storage cloudInitStorage, storageNa
 			continue
 		}
 		if matched != nil {
-			return nil, false, fmt.Errorf("cloud-init ISO upload response was ambiguous (%w) and storage returned duplicate volume %q", err, expectedVolID)
+			return false, fmt.Errorf("storage returned duplicate volume %q", expectedVolID)
 		}
 		matched = content
 	}
 	if matched == nil {
-		return nil, false, fmt.Errorf("cloud-init ISO upload response was ambiguous (%w) and exact volume %q is absent", err, expectedVolID)
+		return false, nil
 	}
 	if matched.Format != "iso" || matched.Size != size {
-		return nil, false, fmt.Errorf("cloud-init ISO upload response was ambiguous (%w) and volume %q metadata mismatched: format=%q size=%d expected_size=%d", err, expectedVolID, matched.Format, matched.Size, size)
+		return false, fmt.Errorf("volume %q metadata mismatched: format=%q size=%d expected_size=%d", expectedVolID, matched.Format, matched.Size, size)
 	}
+	return true, nil
+}
 
-	return nil, true, nil
+func vmBootOrder(vm *proxmox.VirtualMachine) string {
+	if vm.VirtualMachineConfig == nil {
+		return ""
+	}
+	return vm.VirtualMachineConfig.Boot
+}
+
+func appendBootDevice(existing, device string) string {
+	for index, entry := range strings.Split(existing, ";") {
+		if entry == device || (index == 0 && strings.TrimPrefix(entry, "order=") == device) {
+			return existing
+		}
+	}
+	if existing == "" {
+		return "order=" + device
+	}
+	return existing + ";" + device
 }
 
 func fileSHA256(path string) (string, uint64, error) {
@@ -138,15 +217,22 @@ func fileSHA256(path string) (string, uint64, error) {
 	return hex.EncodeToString(h.Sum(nil)), uint64(n), nil
 }
 
-func makeCloudInitISO(userdata, metadata, vendordata, networkconfig string) (path string, err error) {
-	temp, err := os.CreateTemp("", "capmox-cloud-init-*.iso")
+type createTempFileFunc func(dir, pattern string) (*os.File, error)
+
+func makeCloudInitISO(userdata, metadata, vendordata, networkconfig string) (string, error) {
+	return makeCloudInitISOWithFactory(os.CreateTemp, userdata, metadata, vendordata, networkconfig)
+}
+
+func makeCloudInitISOWithFactory(createTemp createTempFileFunc, userdata, metadata, vendordata, networkconfig string) (path string, err error) {
+	temp, err := createTemp("", "capmox-cloud-init-*.iso")
 	if err != nil {
 		return "", err
 	}
-	path = temp.Name()
+	cleanupPath := temp.Name()
+	path = cleanupPath
 	defer func() {
 		if err != nil {
-			_ = os.Remove(path)
+			_ = os.Remove(cleanupPath)
 		}
 	}()
 	if err := temp.Close(); err != nil {
@@ -171,10 +257,7 @@ func makeCloudInitISO(userdata, metadata, vendordata, networkconfig string) (pat
 		return "", err
 	}
 
-	files := []struct{ name, contents string }{
-		{"user-data", userdata},
-		{"meta-data", metadata},
-	}
+	files := []struct{ name, contents string }{{"user-data", userdata}, {"meta-data", metadata}}
 	if vendordata != "" {
 		files = append(files, struct{ name, contents string }{"vendor-data", vendordata})
 	}
@@ -195,11 +278,7 @@ func makeCloudInitISO(userdata, metadata, vendordata, networkconfig string) (pat
 		}
 	}
 
-	if err = fs.Finalize(iso9660.FinalizeOptions{
-		RockRidge:        true,
-		Joliet:           true,
-		VolumeIdentifier: cloudInitISOVolumeIdentifier,
-	}); err != nil {
+	if err = fs.Finalize(iso9660.FinalizeOptions{RockRidge: true, Joliet: true, VolumeIdentifier: cloudInitISOVolumeIdentifier}); err != nil {
 		return "", err
 	}
 	return path, nil

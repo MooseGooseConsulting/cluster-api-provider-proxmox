@@ -123,7 +123,7 @@ func injectCloudInit(ctx context.Context, machineScope *scope.MachineScope, boot
 	// create metadata renderer
 	metadata := cloudinit.NewMetadata(biosUUID, machineScope.Name(), kubernetesVersion, *ptr.Deref(machineScope.ProxmoxMachine.Spec.MetadataSettings, infrav1.MetadataSettings{ProviderIDInjection: new(false)}).ProviderIDInjection)
 
-	injector := getISOInjector(machineScope.InfraCluster.ProxmoxClient, machineScope.VirtualMachine, bootstrapData, metadata, network)
+	injector := getISOInjector(machineScope.InfraCluster.ProxmoxClient, string(machineScope.ProxmoxMachine.UID), machineScope.VirtualMachine, bootstrapData, metadata, network)
 	return injector.Inject(ctx, inject.CloudConfigFormat)
 }
 
@@ -140,7 +140,7 @@ func injectIgnition(ctx context.Context, machineScope *scope.MachineScope, boots
 		Network:       nicData,
 	}
 
-	injector := getIgnitionISOInjector(machineScope.VirtualMachine, metadata, enricher)
+	injector := getIgnitionISOInjector(machineScope.InfraCluster.ProxmoxClient, string(machineScope.ProxmoxMachine.UID), machineScope.VirtualMachine, metadata, enricher)
 	return injector.Inject(ctx, inject.IgnitionFormat)
 }
 
@@ -148,19 +148,22 @@ type isoInjector interface {
 	Inject(ctx context.Context, format inject.BootstrapDataFormat) error
 }
 
-func defaultISOInjector(client capmox.Client, vm *proxmox.VirtualMachine, bootStrapData []byte, metadata, network cloudinit.Renderer) isoInjector {
+func defaultISOInjector(client capmox.Client, machineIdentity string, vm *proxmox.VirtualMachine, bootStrapData []byte, metadata, network cloudinit.Renderer) isoInjector {
 	return &inject.ISOInjector{
 		VirtualMachine:  vm,
 		ProxmoxClient:   client,
+		MachineIdentity: machineIdentity,
 		BootstrapData:   bootStrapData,
 		MetaRenderer:    metadata,
 		NetworkRenderer: network,
 	}
 }
 
-func defaultIgnitionISOInjector(vm *proxmox.VirtualMachine, metadata cloudinit.Renderer, enricher *ignition.Enricher) isoInjector {
+func defaultIgnitionISOInjector(client capmox.Client, machineIdentity string, vm *proxmox.VirtualMachine, metadata cloudinit.Renderer, enricher *ignition.Enricher) isoInjector {
 	return &inject.ISOInjector{
 		VirtualMachine:   vm,
+		ProxmoxClient:    client,
+		MachineIdentity:  machineIdentity,
 		IgnitionEnricher: enricher,
 		MetaRenderer:     metadata,
 	}
