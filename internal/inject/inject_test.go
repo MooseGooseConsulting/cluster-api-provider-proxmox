@@ -159,11 +159,12 @@ func TestISOInjectorInjectCloudInit(t *testing.T) {
 
 	err = injector.Inject(context.Background(), "cloud-config")
 	require.NoError(t, err)
-	require.Len(t, uploadStates, 3)
+	require.Len(t, uploadStates, 4)
 	require.Equal(t, capmox.CloudInitUploadPhaseIntent, uploadStates[0].Phase)
-	require.Equal(t, capmox.CloudInitUploadPhaseAccepted, uploadStates[1].Phase)
-	require.Equal(t, string(ptask.UPID), uploadStates[1].UPID)
-	require.Equal(t, capmox.CloudInitUploadPhaseComplete, uploadStates[2].Phase)
+	require.Equal(t, capmox.CloudInitUploadPhaseDispatching, uploadStates[1].Phase)
+	require.Equal(t, capmox.CloudInitUploadPhaseAccepted, uploadStates[2].Phase)
+	require.Equal(t, string(ptask.UPID), uploadStates[2].UPID)
+	require.Equal(t, capmox.CloudInitUploadPhaseComplete, uploadStates[3].Phase)
 }
 
 func TestISOInjectorInjectCloudInit_Errors(t *testing.T) {

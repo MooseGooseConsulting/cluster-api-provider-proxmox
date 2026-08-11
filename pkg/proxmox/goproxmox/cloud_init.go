@@ -18,6 +18,7 @@ package goproxmox
 
 import (
 	"context"
+	cryptorand "crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
@@ -28,6 +29,8 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/diskfs/go-diskfs/backend/file"
 	"github.com/diskfs/go-diskfs/filesystem/iso9660"
@@ -45,10 +48,50 @@ const (
 	cloudInitStorageFilenamePrefix = "user-data-"
 	cloudInitUnmountedDeviceValue  = "none,media=cdrom"
 	cloudInitDevice                = "ide0"
+	cloudInitDispatchLease         = 2 * time.Minute
 )
 
 var waitForCloudInitTask = func(ctx context.Context, task *proxmox.Task, attempts int) error {
 	return task.WaitFor(ctx, attempts)
+}
+
+var (
+	cloudInitDispatchNow = time.Now
+	cloudInitDispatchID  = func() (string, error) {
+		var id [16]byte
+		if _, err := cryptorand.Read(id[:]); err != nil {
+			return "", err
+		}
+		return hex.EncodeToString(id[:]), nil
+	}
+	cloudInitDispatchLocksMu sync.Mutex
+	cloudInitDispatchLocks   = map[string]*cloudInitDispatchLock{}
+)
+
+type cloudInitDispatchLock struct {
+	mu   sync.Mutex
+	refs int
+}
+
+func acquireCloudInitDispatch(machineIdentity string) func() {
+	cloudInitDispatchLocksMu.Lock()
+	lock := cloudInitDispatchLocks[machineIdentity]
+	if lock == nil {
+		lock = &cloudInitDispatchLock{}
+		cloudInitDispatchLocks[machineIdentity] = lock
+	}
+	lock.refs++
+	cloudInitDispatchLocksMu.Unlock()
+	lock.mu.Lock()
+	return func() {
+		lock.mu.Unlock()
+		cloudInitDispatchLocksMu.Lock()
+		lock.refs--
+		if lock.refs == 0 {
+			delete(cloudInitDispatchLocks, machineIdentity)
+		}
+		cloudInitDispatchLocksMu.Unlock()
+	}
 }
 
 type cloudInitStorage interface {
@@ -88,6 +131,8 @@ func (c *APIClient) CloudInit(ctx context.Context, vm *proxmox.VirtualMachine, m
 	if err := validateCloudInitTargetDevice(vm, machineIdentity, device); err != nil {
 		return err
 	}
+	unlockDispatch := acquireCloudInitDispatch(vm.Node + "/" + machineIdentity)
+	defer unlockDispatch()
 	// The tag is the durable pre-mount ownership marker. Applying it before the
 	// upload lets deletion distinguish a clean, untagged VM from a failed
 	// provisioning attempt that may own an unattached immutable artifact.
@@ -128,18 +173,38 @@ func (c *APIClient) CloudInit(ctx context.Context, vm *proxmox.VirtualMachine, m
 	storage := selection.storage
 
 	uploadState := capmox.CloudInitUpload{
-		Version: 1,
-		Node:    vm.Node,
-		Storage: storage.Name,
-		VolID:   expectedVolID,
-		Size:    size,
-		Attempt: nextAttempt,
-		Phase:   capmox.CloudInitUploadPhaseIntent,
+		Version:        1,
+		Node:           vm.Node,
+		Storage:        storage.Name,
+		VolID:          expectedVolID,
+		Size:           size,
+		Attempt:        nextAttempt,
+		DispatchOwner:  "",
+		LeaseUntilUnix: 0,
+		Phase:          capmox.CloudInitUploadPhaseIntent,
+	}
+	if intentAlreadyRecorded {
+		uploadState.DispatchOwner = current.DispatchOwner
+		uploadState.LeaseUntilUnix = current.LeaseUntilUnix
+	} else {
+		if err := claimCloudInitDispatch(&uploadState); err != nil {
+			return err
+		}
 	}
 	if !intentAlreadyRecorded {
 		if err := recorder(uploadState); err != nil {
 			return fmt.Errorf("record cloud-init upload intent: %w", err)
 		}
+	}
+	uploadState.Phase = capmox.CloudInitUploadPhaseDispatching
+	if err := recorder(uploadState); err != nil {
+		return fmt.Errorf("revalidate cloud-init dispatch ownership: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("cloud-init dispatch context ended after ownership validation: %w", err)
+	}
+	if cloudInitDispatchNow().Unix() >= uploadState.LeaseUntilUnix {
+		return fmt.Errorf("%w: cloud-init dispatch ownership lease expired before POST", capmox.ErrCloudInitUploadPending)
 	}
 
 	uploadTask, proven, err := uploadCloudInitISO(ctx, storage, storage.Name, isoPath, isoName, digest, size)
@@ -189,27 +254,12 @@ func (c *APIClient) resumeCloudInitUpload(ctx context.Context, node *proxmox.Nod
 		return true, false, fmt.Errorf("%w: get recorded storage %q: %v", capmox.ErrCloudInitUploadPending, current.Storage, err)
 	}
 	switch current.Phase {
-	case capmox.CloudInitUploadPhaseIntent:
-		present, inspectErr := inspectCloudInitISO(ctx, storage, current.Storage, isoName, size)
-		if inspectErr != nil {
-			return true, false, fmt.Errorf("%w: inspect exact intent artifact: %v", capmox.ErrCloudInitUploadPending, inspectErr)
-		}
-		if err := requireCloudInitUploadQuiescence(ctx, node); err != nil {
+	case capmox.CloudInitUploadPhaseIntent, capmox.CloudInitUploadPhaseDispatching:
+		rearmed, err := c.resumeUnacknowledgedCloudInitUpload(ctx, node, storage, isoName, size, current, recorder)
+		if err != nil {
 			return true, false, err
 		}
-		if !present {
-			if current.Attempt == ^uint64(0) {
-				return true, false, errors.New("cloud-init upload attempt generation overflow")
-			}
-			rearmed := *current
-			rearmed.Attempt++
-			if rearmed.Attempt == 0 {
-				rearmed.Attempt = 1
-			}
-			if err := recorder(rearmed); err != nil {
-				return true, false, fmt.Errorf("rearm quiescent cloud-init upload intent: %w", err)
-			}
-			*current = rearmed
+		if rearmed {
 			return false, true, nil
 		}
 	case capmox.CloudInitUploadPhaseAccepted:
@@ -245,6 +295,57 @@ func (c *APIClient) resumeCloudInitUpload(ctx context.Context, node *proxmox.Nod
 		return true, false, err
 	}
 	return true, false, nil
+}
+
+func (c *APIClient) resumeUnacknowledgedCloudInitUpload(ctx context.Context, node *proxmox.Node, storage cloudInitStorage, isoName string, size uint64, current *capmox.CloudInitUpload, recorder capmox.CloudInitUploadRecorder) (bool, error) {
+	if current.DispatchOwner == "" && current.LeaseUntilUnix != 0 {
+		return false, errors.New("cloud-init upload intent has a lease without an owner")
+	}
+	if current.Phase == capmox.CloudInitUploadPhaseDispatching && current.DispatchOwner == "" {
+		return false, errors.New("dispatching cloud-init upload has no durable owner")
+	}
+	if current.DispatchOwner != "" && current.LeaseUntilUnix > cloudInitDispatchNow().Unix() {
+		return false, fmt.Errorf("%w: durable cloud-init dispatch owner %q remains live", capmox.ErrCloudInitUploadPending, current.DispatchOwner)
+	}
+	present, inspectErr := inspectCloudInitISO(ctx, storage, current.Storage, isoName, size)
+	if inspectErr != nil {
+		return false, fmt.Errorf("%w: inspect exact intent artifact: %v", capmox.ErrCloudInitUploadPending, inspectErr)
+	}
+	if err := requireCloudInitUploadQuiescence(ctx, node); err != nil {
+		return false, err
+	}
+	if present {
+		return false, nil
+	}
+	if current.Attempt == ^uint64(0) {
+		return false, errors.New("cloud-init upload attempt generation overflow")
+	}
+	rearmed := *current
+	rearmed.Attempt++
+	if rearmed.Attempt == 0 {
+		rearmed.Attempt = 1
+	}
+	rearmed.Phase = capmox.CloudInitUploadPhaseIntent
+	if err := claimCloudInitDispatch(&rearmed); err != nil {
+		return false, err
+	}
+	if err := recorder(rearmed); err != nil {
+		return false, fmt.Errorf("rearm quiescent cloud-init upload intent: %w", err)
+	}
+	*current = rearmed
+	return true, nil
+}
+
+func claimCloudInitDispatch(upload *capmox.CloudInitUpload) error {
+	owner, err := cloudInitDispatchID()
+	if err != nil {
+		return fmt.Errorf("create cloud-init dispatch owner: %w", err)
+	}
+	upload.DispatchOwner = owner
+	upload.LeaseUntilUnix = cloudInitDispatchNow().Add(cloudInitDispatchLease).Unix()
+	upload.UPID = ""
+	upload.Phase = capmox.CloudInitUploadPhaseIntent
+	return nil
 }
 
 func requireCloudInitUploadQuiescence(ctx context.Context, node *proxmox.Node) error {

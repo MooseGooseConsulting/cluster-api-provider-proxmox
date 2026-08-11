@@ -219,6 +219,8 @@ func (c *APIClient) DeleteVM(ctx context.Context, nodeName string, vmID int64, m
 	if vmID < 100 {
 		return nil, fmt.Errorf("%w: vm id %d is below the minimum", ErrVMIDFree, vmID)
 	}
+	unlockDispatch := acquireCloudInitDispatch(nodeName + "/" + machineIdentity)
+	defer unlockDispatch()
 
 	node := (&proxmox.Node{}).New(c.Client, nodeName)
 	if err := node.Status(ctx); err != nil {
@@ -281,6 +283,31 @@ func (c *APIClient) reconcileRecordedCloudInitUpload(ctx context.Context, node *
 	if upload == nil {
 		return nil
 	}
+	if err := validateRecordedCloudInitUpload(node, machineIdentity, upload); err != nil {
+		return err
+	}
+	storage, err := node.Storage(ctx, upload.Storage)
+	if err != nil {
+		return fmt.Errorf("get recorded cloud-init storage %q: %w", upload.Storage, err)
+	}
+	if err := c.waitForRecordedCloudInitUpload(ctx, node, upload); err != nil {
+		return err
+	}
+	isoName := strings.TrimPrefix(upload.VolID, upload.Storage+":iso/")
+	present, err := inspectCloudInitISO(ctx, storage, upload.Storage, isoName, upload.Size)
+	if err != nil {
+		return fmt.Errorf("inspect recorded cloud-init upload %q: %w", upload.VolID, err)
+	}
+	if !present {
+		return nil
+	}
+	if _, err := deleteOwnedCloudInitVolume(ctx, storage, upload.VolID); err != nil {
+		return fmt.Errorf("delete recorded cloud-init upload %q: %w", upload.VolID, err)
+	}
+	return nil
+}
+
+func validateRecordedCloudInitUpload(node *proxmox.Node, machineIdentity string, upload *capmox.CloudInitUpload) error {
 	if upload.Version != 1 || upload.Node != node.Name || upload.Storage == "" || upload.Size == 0 {
 		return fmt.Errorf("invalid cloud-init upload record: version=%d node=%q storage=%q size=%d", upload.Version, upload.Node, upload.Storage, upload.Size)
 	}
@@ -288,6 +315,10 @@ func (c *APIClient) reconcileRecordedCloudInitUpload(ctx context.Context, node *
 	case capmox.CloudInitUploadPhaseIntent:
 		if upload.UPID != "" {
 			return errors.New("cloud-init upload intent unexpectedly contains a task UPID")
+		}
+	case capmox.CloudInitUploadPhaseDispatching:
+		if upload.UPID != "" || upload.DispatchOwner == "" || upload.LeaseUntilUnix == 0 {
+			return errors.New("dispatching cloud-init upload has invalid durable ownership")
 		}
 	case capmox.CloudInitUploadPhaseAccepted:
 		if upload.UPID == "" {
@@ -305,11 +336,17 @@ func (c *APIClient) reconcileRecordedCloudInitUpload(ctx context.Context, node *
 	if _, err := cloudInitISOName(machineIdentity, digest); err != nil {
 		return fmt.Errorf("invalid recorded cloud-init volume %q: %w", upload.VolID, err)
 	}
-	storage, err := node.Storage(ctx, upload.Storage)
-	if err != nil {
-		return fmt.Errorf("get recorded cloud-init storage %q: %w", upload.Storage, err)
-	}
-	if upload.Phase == capmox.CloudInitUploadPhaseIntent {
+	return nil
+}
+
+func (c *APIClient) waitForRecordedCloudInitUpload(ctx context.Context, node *proxmox.Node, upload *capmox.CloudInitUpload) error {
+	if upload.Phase == capmox.CloudInitUploadPhaseIntent || upload.Phase == capmox.CloudInitUploadPhaseDispatching {
+		if upload.DispatchOwner == "" && upload.LeaseUntilUnix != 0 {
+			return errors.New("cloud-init upload intent has a lease without an owner")
+		}
+		if upload.DispatchOwner != "" && upload.LeaseUntilUnix > cloudInitDispatchNow().Unix() {
+			return fmt.Errorf("%w: durable cloud-init dispatch owner %q remains live", capmox.ErrCloudInitUploadPending, upload.DispatchOwner)
+		}
 		if err := requireCloudInitUploadQuiescence(ctx, node); err != nil {
 			return err
 		}
@@ -324,17 +361,6 @@ func (c *APIClient) reconcileRecordedCloudInitUpload(ctx context.Context, node *
 		if waitErr != nil && !taskFailed {
 			return fmt.Errorf("recorded cloud-init upload task %q is not terminal: %w", upload.UPID, waitErr)
 		}
-	}
-	isoName := strings.TrimPrefix(upload.VolID, upload.Storage+":iso/")
-	present, err := inspectCloudInitISO(ctx, storage, upload.Storage, isoName, upload.Size)
-	if err != nil {
-		return fmt.Errorf("inspect recorded cloud-init upload %q: %w", upload.VolID, err)
-	}
-	if !present {
-		return nil
-	}
-	if _, err := deleteOwnedCloudInitVolume(ctx, storage, upload.VolID); err != nil {
-		return fmt.Errorf("delete recorded cloud-init upload %q: %w", upload.VolID, err)
 	}
 	return nil
 }

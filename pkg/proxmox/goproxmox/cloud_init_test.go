@@ -28,6 +28,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -762,11 +763,14 @@ func TestCloudInitRecoveredUploadTagsMountsAndPreservesBoot(t *testing.T) {
 	require.Equal(t, "user-data-machine-uid-"+logicalDigest+".iso", uploadedName)
 	require.Equal(t, "local:iso/"+uploadedName+",media=cdrom", mounted)
 	require.Equal(t, "order=scsi0;net0;ide0", boot)
-	require.Len(t, uploadStates, 2, "an EOF response with exact storage proof has no task UPID to persist")
+	require.Len(t, uploadStates, 3, "an EOF response with exact storage proof has no task UPID to persist")
 	require.Equal(t, capmox.CloudInitUploadPhaseIntent, uploadStates[0].Phase)
 	require.Empty(t, uploadStates[0].UPID)
-	require.Equal(t, capmox.CloudInitUploadPhaseComplete, uploadStates[1].Phase)
-	require.Equal(t, "local:iso/"+uploadedName, uploadStates[1].VolID)
+	require.NotEmpty(t, uploadStates[0].DispatchOwner)
+	require.Equal(t, capmox.CloudInitUploadPhaseDispatching, uploadStates[1].Phase)
+	require.Equal(t, uploadStates[0].DispatchOwner, uploadStates[1].DispatchOwner)
+	require.Equal(t, capmox.CloudInitUploadPhaseComplete, uploadStates[2].Phase)
+	require.Equal(t, "local:iso/"+uploadedName, uploadStates[2].VolID)
 	_, decodeErr := hex.DecodeString(uploadedChecksum)
 	require.NoError(t, decodeErr)
 }
@@ -798,6 +802,8 @@ func TestCloudInitResumesAcceptedUploadWithoutRedispatch(t *testing.T) {
 	vm.New(client.Client, "pve", 320)
 	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve/status$`,
 		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": proxmox.Node{Name: "pve"}}))
+	httpmock.RegisterResponder(http.MethodGet, `=~/cluster/status$`,
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": proxmox.NodeStatuses{{Name: "pve"}}}))
 	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve/storage/local/status$`,
 		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": proxmox.Storage{Name: "local", Content: "iso", Enabled: 1, Avail: 1 << 30}}))
 	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve/storage/local/content$`,
@@ -852,6 +858,8 @@ func TestCloudInitRearmsQuiescentIntentAndDispatchesExactlyOnce(t *testing.T) {
 	vm.New(client.Client, "pve", 320)
 	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve/status$`,
 		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": proxmox.Node{Name: "pve"}}))
+	httpmock.RegisterResponder(http.MethodGet, `=~/cluster/status$`,
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": proxmox.NodeStatuses{{Name: "pve"}}}))
 	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve/storage/local/status$`,
 		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": proxmox.Storage{Name: "local", Content: "iso", Enabled: 1, Avail: 1 << 30}}))
 	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve/storage$`,
@@ -879,19 +887,75 @@ func TestCloudInitRearmsQuiescentIntentAndDispatchesExactlyOnce(t *testing.T) {
 	httpmock.RegisterResponder(http.MethodGet, fmt.Sprintf(`=~/nodes/pve/tasks/%s/status$`, string(mountUPID)),
 		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": proxmox.Task{UPID: mountUPID, Node: "pve", Status: "stopped", ExitStatus: "OK"}}))
 
-	var recorded []capmox.CloudInitUpload
-	err = client.CloudInit(context.Background(), vm, "machine-uid", "ide0", userdata, metadata, "", networkConfig, current, func(upload capmox.CloudInitUpload) error {
+	var (
+		recordedMu sync.Mutex
+		recorded   []capmox.CloudInitUpload
+		claimOnce  sync.Once
+	)
+	claimReached := make(chan struct{})
+	releaseClaim := make(chan struct{})
+	recorder := func(upload capmox.CloudInitUpload) error {
+		if upload.Attempt == 0 {
+			return errors.New("dispatch attempt must be nonzero")
+		}
+		recordedMu.Lock()
 		recorded = append(recorded, upload)
+		recordedMu.Unlock()
+		if upload.Phase == capmox.CloudInitUploadPhaseIntent && upload.Attempt == 2 {
+			claimOnce.Do(func() {
+				close(claimReached)
+				<-releaseClaim
+			})
+		}
 		return nil
-	})
-	require.NoError(t, err)
+	}
+	errs := make(chan error, 3)
+	go func() {
+		errs <- client.CloudInit(context.Background(), vm, "machine-uid", "ide0", userdata, metadata, "", networkConfig, current, recorder)
+	}()
+	<-claimReached
+	bootstrapStarted := make(chan struct{})
+	go func() {
+		close(bootstrapStarted)
+		errs <- client.CloudInit(context.Background(), vm, "machine-uid", "ide0", userdata, metadata, "", networkConfig, current, recorder)
+	}()
+	deleteStarted := make(chan struct{})
+	go func() {
+		close(deleteStarted)
+		_, deleteErr := client.DeleteVM(context.Background(), "pve", 320, "machine-uid", current)
+		errs <- deleteErr
+	}()
+	<-bootstrapStarted
+	<-deleteStarted
+	select {
+	case err := <-errs:
+		require.Failf(t, "concurrent operation escaped dispatch ownership", "returned before owner release: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	require.Zero(t, uploadCalls, "the owner is paused before POST and concurrent bootstrap/deletion must remain serialized")
+	close(releaseClaim)
+	results := []error{<-errs, <-errs, <-errs}
+	completed := 0
+	pending := 0
+	for _, result := range results {
+		if result == nil {
+			completed++
+		} else if errors.Is(result, capmox.ErrCloudInitUploadPending) {
+			pending++
+		}
+	}
+	require.Equal(t, 1, completed, "only the durable dispatch owner may complete")
+	require.Equal(t, 2, pending, "stale bootstrap and deletion must observe the live owner: results=%v", results)
 	require.Equal(t, 1, uploadCalls)
-	require.Len(t, recorded, 3)
+	require.Len(t, recorded, 4)
 	require.Equal(t, capmox.CloudInitUploadPhaseIntent, recorded[0].Phase)
-	require.Equal(t, uint64(2), recorded[0].Attempt, "restart must CAS-rearm the orphan intent before dispatch")
-	require.Equal(t, capmox.CloudInitUploadPhaseAccepted, recorded[1].Phase)
-	require.Equal(t, capmox.CloudInitUploadPhaseComplete, recorded[2].Phase)
-	require.Equal(t, uint64(2), recorded[2].Attempt)
+	require.Equal(t, uint64(2), recorded[0].Attempt, "restart must claim the orphan intent before dispatch")
+	require.NotEmpty(t, recorded[0].DispatchOwner)
+	require.Equal(t, capmox.CloudInitUploadPhaseDispatching, recorded[1].Phase)
+	require.Equal(t, recorded[0].DispatchOwner, recorded[1].DispatchOwner)
+	require.Equal(t, capmox.CloudInitUploadPhaseAccepted, recorded[2].Phase)
+	require.Equal(t, capmox.CloudInitUploadPhaseComplete, recorded[3].Phase)
+	require.Equal(t, uint64(2), recorded[3].Attempt)
 }
 
 func TestCloudInitIntentDoesNotRedispatchWhileImgcopyIsActive(t *testing.T) {
@@ -916,6 +980,73 @@ func TestCloudInitIntentDoesNotRedispatchWhileImgcopyIsActive(t *testing.T) {
 	require.ErrorIs(t, err, capmox.ErrCloudInitUploadPending)
 	require.Zero(t, httpmock.GetCallCountInfo()["POST =~/nodes/pve/storage/local/upload$"])
 	require.Equal(t, uint64(1), current.Attempt)
+}
+
+func TestCloudInitRequiresCurrentOwnershipImmediatelyBeforePOST(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		mode string
+	}{
+		{name: "stale resource version", mode: "conflict"},
+		{name: "cancelled leader context", mode: "cancel"},
+		{name: "expired dispatch lease", mode: "expire"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			client := newTestClient(t)
+			const (
+				userdata      = "user-data"
+				metadata      = "meta-data"
+				networkConfig = "network-data"
+			)
+			isoPath, err := makeCloudInitISO(userdata, metadata, "", networkConfig)
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = os.Remove(isoPath) })
+			_, size, err := fileSHA256(isoPath)
+			require.NoError(t, err)
+			isoName, err := cloudInitISOName("machine-uid", cloudInitBootstrapDigest(userdata, metadata, "", networkConfig))
+			require.NoError(t, err)
+			current := &capmox.CloudInitUpload{Version: 1, Node: "pve", Storage: "local", VolID: "local:iso/" + isoName, Size: size, Attempt: 1, Phase: capmox.CloudInitUploadPhaseIntent}
+			cloudInitTag := proxmox.MakeTag(proxmox.TagCloudInit)
+			vm := &proxmox.VirtualMachine{Node: "pve", VMID: 320, VirtualMachineConfig: &proxmox.VirtualMachineConfig{IDE0: cloudInitUnmountedDeviceValue, Tags: cloudInitTag, TagsSlice: []string{cloudInitTag}}}
+			vm.New(client.Client, "pve", 320)
+			httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve/status$`, httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": proxmox.Node{Name: "pve"}}))
+			httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve/storage/local/status$`, httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": proxmox.Storage{Name: "local", Content: "iso", Enabled: 1, Avail: 1 << 30}}))
+			httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve/storage$`, httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": &proxmox.Storages{{Name: "local", Content: "iso", Enabled: 1, Avail: 1 << 30}}}))
+			httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve/storage/local/content$`, httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": []*proxmox.StorageContent{}}))
+			httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve/tasks\?limit=1&source=active&typefilter=imgcopy$`, httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": []*proxmox.Task{}}))
+
+			ctx, cancel := context.WithCancel(context.Background())
+			t.Cleanup(cancel)
+			staleOwnerErr := errors.New("stale resourceVersion cannot replace another dispatch owner")
+			originalNow := cloudInitDispatchNow
+			t.Cleanup(func() { cloudInitDispatchNow = originalNow })
+			recorder := func(upload capmox.CloudInitUpload) error {
+				if upload.Phase != capmox.CloudInitUploadPhaseDispatching {
+					return nil
+				}
+				switch test.mode {
+				case "conflict":
+					return staleOwnerErr
+				case "cancel":
+					cancel()
+				case "expire":
+					cloudInitDispatchNow = func() time.Time { return time.Unix(upload.LeaseUntilUnix, 0) }
+				}
+				return nil
+			}
+
+			err = client.CloudInit(ctx, vm, "machine-uid", "ide0", userdata, metadata, "", networkConfig, current, recorder)
+			switch test.mode {
+			case "conflict":
+				require.ErrorIs(t, err, staleOwnerErr)
+			case "cancel":
+				require.ErrorIs(t, err, context.Canceled)
+			case "expire":
+				require.ErrorIs(t, err, capmox.ErrCloudInitUploadPending)
+			}
+			require.Zero(t, httpmock.GetCallCountInfo()["POST =~/nodes/pve/storage/local/upload$"], "failed ownership revalidation must never cross the external POST boundary")
+		})
+	}
 }
 
 func TestRecoverOwnedCloudInitVolumeRejectsCrossStorageDuplicates(t *testing.T) {

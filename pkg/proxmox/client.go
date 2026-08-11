@@ -35,14 +35,16 @@ var ErrCloudInitUploadPending = errors.New("cloud-init upload is pending")
 // CloudInitUpload records the durable identity and progress of one immutable
 // cloud-init upload. Callers persist each update before CloudInit continues.
 type CloudInitUpload struct {
-	Version int    `json:"version"`
-	Node    string `json:"node"`
-	Storage string `json:"storage"`
-	VolID   string `json:"volID"`
-	Size    uint64 `json:"size"`
-	Attempt uint64 `json:"attempt,omitempty"`
-	UPID    string `json:"upid,omitempty"`
-	Phase   string `json:"phase"`
+	Version        int    `json:"version"`
+	Node           string `json:"node"`
+	Storage        string `json:"storage"`
+	VolID          string `json:"volID"`
+	Size           uint64 `json:"size"`
+	Attempt        uint64 `json:"attempt,omitempty"`
+	DispatchOwner  string `json:"dispatchOwner,omitempty"`
+	LeaseUntilUnix int64  `json:"leaseUntilUnix,omitempty"`
+	UPID           string `json:"upid,omitempty"`
+	Phase          string `json:"phase"`
 }
 
 // CloudInitUploadRecorder durably records an upload boundary.
@@ -51,6 +53,8 @@ type CloudInitUploadRecorder func(CloudInitUpload) error
 const (
 	// CloudInitUploadPhaseIntent means the exact target was durably recorded before dispatch.
 	CloudInitUploadPhaseIntent = "intent"
+	// CloudInitUploadPhaseDispatching means the durable owner was revalidated immediately before POST.
+	CloudInitUploadPhaseDispatching = "dispatching"
 	// CloudInitUploadPhaseAccepted means PVE returned a task UPID that was durably recorded.
 	CloudInitUploadPhaseAccepted = "accepted"
 	// CloudInitUploadPhaseComplete means the exact artifact was proven after task completion.
