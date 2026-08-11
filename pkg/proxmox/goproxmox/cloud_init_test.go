@@ -227,6 +227,8 @@ func TestUploadCloudInitISOProof(t *testing.T) {
 	ambiguousEOF := &url.Error{Op: "Post", URL: "https://pve.test/api2/json/nodes/pve/storage/local/upload", Err: io.EOF}
 	ambiguousUnexpectedEOF := &url.Error{Op: "Post", URL: "https://pve.test/api2/json/nodes/pve/storage/local/upload", Err: io.ErrUnexpectedEOF}
 	ambiguousReset := &url.Error{Op: "Post", URL: "https://pve.test/api2/json/nodes/pve/storage/local/upload", Err: errors.New("connection reset")}
+	var malformed any
+	ambiguousMalformedResponse := json.Unmarshal([]byte("{"), &malformed)
 	tests := []struct {
 		name             string
 		storage          *fakeCloudInitStorage
@@ -239,6 +241,7 @@ func TestUploadCloudInitISOProof(t *testing.T) {
 		{name: "accept then EOF proves exact content-addressed artifact", storage: &fakeCloudInitStorage{uploadErr: ambiguousEOF, results: []storageResult{{}, {contents: []*proxmox.StorageContent{exact}}}}, wantProven: true, wantUploads: 1, wantContentCalls: 2},
 		{name: "accept then unexpected EOF proves exact content-addressed artifact", storage: &fakeCloudInitStorage{uploadErr: ambiguousUnexpectedEOF, results: []storageResult{{}, {contents: []*proxmox.StorageContent{exact}}}}, wantProven: true, wantUploads: 1, wantContentCalls: 2},
 		{name: "accept then connection reset proves exact content-addressed artifact", storage: &fakeCloudInitStorage{uploadErr: ambiguousReset, results: []storageResult{{}, {contents: []*proxmox.StorageContent{exact}}}}, wantProven: true, wantUploads: 1, wantContentCalls: 2},
+		{name: "accept then malformed response proves exact content-addressed artifact", storage: &fakeCloudInitStorage{uploadErr: ambiguousMalformedResponse, results: []storageResult{{}, {contents: []*proxmox.StorageContent{exact}}}}, wantProven: true, wantUploads: 1, wantContentCalls: 2},
 		{name: "accepted upload cancelled by leader shutdown proves exact artifact", storage: &fakeCloudInitStorage{uploadErr: context.Canceled, results: []storageResult{{}, {contents: []*proxmox.StorageContent{exact}}}}, wantProven: true, wantUploads: 1, wantContentCalls: 2},
 		{name: "exact pre-existing immutable artifact avoids duplicate upload", storage: &fakeCloudInitStorage{results: []storageResult{{contents: []*proxmox.StorageContent{exact}}}}, wantProven: true, wantUploads: 0, wantContentCalls: 1},
 		{name: "pre-existing mismatch fails before dispatch", storage: &fakeCloudInitStorage{results: []storageResult{{contents: []*proxmox.StorageContent{mismatch}}}}, wantError: "preflight failed", wantUploads: 0, wantContentCalls: 1},
