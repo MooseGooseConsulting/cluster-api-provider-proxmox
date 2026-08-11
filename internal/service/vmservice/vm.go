@@ -394,12 +394,7 @@ func getClusterAPIMachineAddresses(scope *scope.MachineScope) ([]clusterv1.Machi
 		return nil, errors.New("unable to apply configuration as long as the virtual machine is not running")
 	}
 
-	addresses := []clusterv1.MachineAddress{
-		{
-			Type:    clusterv1.MachineHostName,
-			Address: scope.Machine.GetName(),
-		},
-	}
+	addresses := []clusterv1.MachineAddress{}
 
 	machineAddresses := scope.ProxmoxMachine.GetIPAddresses()
 	index := slices.IndexFunc(machineAddresses, func(s infrav1.IPAddressesSpec) bool {
