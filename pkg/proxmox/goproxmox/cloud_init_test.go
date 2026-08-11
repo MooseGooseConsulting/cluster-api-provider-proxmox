@@ -52,12 +52,13 @@ type fakeCloudInitStorage struct {
 	algorithm       string
 	deletedVolume   string
 	deleteCalls     int
+	deleteErr       error
 }
 
 func (s *fakeCloudInitStorage) DeleteContent(_ context.Context, content string) (*proxmox.Task, error) {
 	s.deleteCalls++
 	s.deletedVolume = content
-	return nil, nil
+	return nil, s.deleteErr
 }
 
 func (s *fakeCloudInitStorage) UploadWithHash(content, _ string, storageFilename *string, checksum, checksumAlgorithm string) (*proxmox.Task, error) {
@@ -290,7 +291,7 @@ func TestDeleteOwnedCloudInitVolume(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			storage := &fakeCloudInitStorage{results: []storageResult{{contents: test.contents}}}
-			_, deleted, err := deleteOwnedCloudInitVolume(context.Background(), storage, volID)
+			deleted, err := deleteOwnedCloudInitVolume(context.Background(), storage, volID)
 			if test.wantError == "" {
 				require.NoError(t, err)
 			} else {
@@ -305,6 +306,61 @@ func TestDeleteOwnedCloudInitVolume(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestDeleteOwnedCloudInitVolumeAmbiguousResponse(t *testing.T) {
+	volID := "local:iso/user-data-machine-a-" + strings.Repeat("a", cloudInitDigestLength) + ".iso"
+	tests := []struct {
+		name       string
+		deleteErr  error
+		postDelete []*proxmox.StorageContent
+		wantError  bool
+	}{
+		{name: "EOF accepted after absence proof", deleteErr: io.EOF},
+		{name: "UnexpectedEOF accepted after absence proof", deleteErr: io.ErrUnexpectedEOF},
+		{name: "EOF rejected while artifact remains", deleteErr: io.EOF, postDelete: []*proxmox.StorageContent{{Volid: volID, Format: "iso"}}, wantError: true},
+		{name: "authoritative error not swallowed", deleteErr: errors.New("permission denied"), wantError: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			storage := &fakeCloudInitStorage{
+				deleteErr: test.deleteErr,
+				results: []storageResult{
+					{contents: []*proxmox.StorageContent{{Volid: volID, Format: "iso"}}},
+					{contents: test.postDelete},
+				},
+			}
+			deleted, err := deleteOwnedCloudInitVolume(context.Background(), storage, volID)
+			if test.wantError {
+				require.Error(t, err)
+				require.False(t, deleted)
+			} else {
+				require.NoError(t, err)
+				require.True(t, deleted)
+			}
+			require.Equal(t, 1, storage.deleteCalls)
+		})
+	}
+}
+
+func TestOwnedCloudInitCandidate(t *testing.T) {
+	digestA := strings.Repeat("a", cloudInitDigestLength)
+	digestB := strings.Repeat("b", cloudInitDigestLength)
+	ownedA := "local:iso/user-data-machine-a-" + digestA + ".iso"
+	ownedB := "other:iso/user-data-machine-a-" + digestB + ".iso"
+
+	volID, found, err := ownedCloudInitCandidate([]*proxmox.StorageContent{
+		{Volid: "local:iso/user-data-machine-b-" + digestA + ".iso", Format: "iso"},
+		{Volid: ownedA, Format: "iso"},
+	}, "machine-a")
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, ownedA, volID)
+
+	_, _, err = ownedCloudInitCandidate([]*proxmox.StorageContent{{Volid: ownedA, Format: "iso"}, {Volid: ownedB, Format: "iso"}}, "machine-a")
+	require.ErrorContains(t, err, "multiple owned")
+	_, _, err = ownedCloudInitCandidate([]*proxmox.StorageContent{{Volid: ownedA, Format: "raw"}}, "machine-a")
+	require.ErrorContains(t, err, "unexpected format")
 }
 
 func TestMakeCloudInitISOErrorRemovesTemporaryFile(t *testing.T) {
@@ -415,4 +471,72 @@ func TestCloudInitRecoveredUploadTagsMountsAndPreservesBoot(t *testing.T) {
 	require.Equal(t, "order=scsi0;net0;ide0", boot)
 	_, decodeErr := hex.DecodeString(uploadedChecksum)
 	require.NoError(t, decodeErr)
+}
+
+func TestUnmountCloudInitISORecoversAfterUnmountAndTagFailure(t *testing.T) {
+	client := newTestClient(t)
+	digest := strings.Repeat("a", cloudInitDigestLength)
+	volID := "local:iso/user-data-machine-uid-" + digest + ".iso"
+	cloudInitTag := proxmox.MakeTag(proxmox.TagCloudInit)
+	vmFixture := &proxmox.VirtualMachine{
+		Node: "pve",
+		VMID: proxmox.StringOrUint64(320),
+		VirtualMachineConfig: &proxmox.VirtualMachineConfig{
+			IDE0: "none,media=cdrom", Tags: cloudInitTag, TagsSlice: []string{cloudInitTag},
+		},
+	}
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve/status$`,
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": proxmox.Node{Name: "pve"}}))
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve/qemu/320/status/current$`,
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": vmFixture}))
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve/qemu/320/config$`,
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": vmFixture.VirtualMachineConfig}))
+	vm, err := client.GetVM(context.Background(), "pve", 320)
+	require.NoError(t, err)
+
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve/storage$`,
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": &proxmox.Storages{{Name: "local", Content: "iso", Enabled: 1}}}))
+	contentPresent := true
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve/storage/local/content$`, func(*http.Request) (*http.Response, error) {
+		contents := []*proxmox.StorageContent{}
+		if contentPresent {
+			contents = append(contents, &proxmox.StorageContent{Volid: volID, Format: "iso", Size: 4096})
+		}
+		return httpmock.NewJsonResponse(200, map[string]any{"data": contents})
+	})
+
+	upid := proxmox.UPID("UPID:pve:003B4235:1DF4ABCA:667C1C45:imgdel:320:root@pam:")
+	deleteCalls := 0
+	httpmock.RegisterResponder(http.MethodDelete, `=~/nodes/pve/storage/local/content/.*$`, func(request *http.Request) (*http.Response, error) {
+		deleteCalls++
+		require.Contains(t, request.URL.Path, "user-data-machine-uid-"+digest+".iso")
+		contentPresent = false
+		return httpmock.NewJsonResponse(200, map[string]any{"data": upid})
+	})
+	completedTask := &proxmox.Task{UPID: upid, Node: "pve", Status: "completed", IsRunning: false}
+	httpmock.RegisterResponder(http.MethodGet, fmt.Sprintf(`=~/nodes/pve/tasks/%s/status$`, string(upid)),
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": completedTask}))
+
+	tagCalls := 0
+	httpmock.RegisterResponder(http.MethodPost, `=~/nodes/pve/qemu/320/config$`, func(*http.Request) (*http.Response, error) {
+		tagCalls++
+		if tagCalls == 1 {
+			return httpmock.NewStringResponse(500, "tag update failed"), nil
+		}
+		return httpmock.NewJsonResponse(200, map[string]any{"data": upid})
+	})
+
+	err = client.UnmountCloudInitISO(context.Background(), vm, "machine-uid", "ide0")
+	require.Error(t, err, "the first pass must surface tag removal failure after exact deletion")
+	require.Equal(t, 1, deleteCalls)
+	require.False(t, contentPresent)
+
+	// A real reconciliation refetches the still-tagged VM after the failed tag
+	// update. Exact absence is then safe replay state and no second delete occurs.
+	vm.VirtualMachineConfig.Tags = cloudInitTag
+	vm.VirtualMachineConfig.TagsSlice = []string{cloudInitTag}
+	err = client.UnmountCloudInitISO(context.Background(), vm, "machine-uid", "ide0")
+	require.NoError(t, err)
+	require.Equal(t, 1, deleteCalls)
+	require.Equal(t, 2, tagCalls)
 }

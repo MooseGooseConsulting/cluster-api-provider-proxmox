@@ -35,6 +35,7 @@ import (
 const (
 	cloudInitISOBlockSize          = 2048
 	cloudInitISOVolumeIdentifier   = "cidata"
+	cloudInitISOContentType        = "iso"
 	cloudInitDigestLength          = sha256.Size * 2
 	maxPVEStorageFilenameLength    = 255
 	cloudInitStorageFilenamePrefix = "user-data-"
@@ -145,7 +146,7 @@ func uploadCloudInitISO(ctx context.Context, storage cloudInitStorage, storageNa
 		return nil, true, nil
 	}
 
-	task, err := storage.UploadWithHash("iso", isoPath, &isoName, digest, "sha256")
+	task, err := storage.UploadWithHash(cloudInitISOContentType, isoPath, &isoName, digest, "sha256")
 	if err == nil {
 		return task, false, nil
 	}
@@ -189,7 +190,7 @@ func inspectCloudInitISO(ctx context.Context, storage cloudInitStorage, storageN
 	if matched == nil {
 		return false, nil
 	}
-	if matched.Format != "iso" || matched.Size != size {
+	if matched.Format != cloudInitISOContentType || matched.Size != size {
 		return false, fmt.Errorf("volume %q metadata mismatched: format=%q size=%d expected_size=%d", expectedVolID, matched.Format, matched.Size, size)
 	}
 	return true, nil
@@ -274,22 +275,72 @@ func inspectOwnedCloudInitVolume(ctx context.Context, storage cloudInitStorage, 
 	if matched == nil {
 		return false, nil
 	}
-	if matched.Format != "iso" {
+	if matched.Format != cloudInitISOContentType {
 		return false, fmt.Errorf("cloud-init volume %q has unexpected format %q", volID, matched.Format)
 	}
 	return true, nil
 }
 
-func deleteOwnedCloudInitVolume(ctx context.Context, storage cloudInitStorage, volID string) (*proxmox.Task, bool, error) {
+func deleteOwnedCloudInitVolume(ctx context.Context, storage cloudInitStorage, volID string) (bool, error) {
 	present, err := inspectOwnedCloudInitVolume(ctx, storage, volID)
 	if err != nil || !present {
-		return nil, false, err
+		return false, err
 	}
 	task, err := storage.DeleteContent(ctx, volID)
 	if err != nil {
-		return nil, false, err
+		if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+			return false, err
+		}
+		stillPresent, proofErr := inspectOwnedCloudInitVolume(ctx, storage, volID)
+		if proofErr != nil || stillPresent {
+			return false, fmt.Errorf("cloud-init volume delete response was ambiguous (%w) and absence proof failed: %v", err, proofErr)
+		}
+		return true, nil
 	}
-	return task, true, nil
+	if task != nil {
+		if waitErr := task.WaitFor(ctx, 2); waitErr != nil {
+			stillPresent, proofErr := inspectOwnedCloudInitVolume(ctx, storage, volID)
+			if proofErr != nil || stillPresent {
+				return false, fmt.Errorf("cloud-init volume delete task failed (%w) and absence proof failed: %v", waitErr, proofErr)
+			}
+			return true, nil
+		}
+	}
+	stillPresent, proofErr := inspectOwnedCloudInitVolume(ctx, storage, volID)
+	if proofErr != nil {
+		return false, proofErr
+	}
+	if stillPresent {
+		return false, fmt.Errorf("cloud-init volume %q remains after successful delete", volID)
+	}
+	return true, nil
+}
+
+func ownedCloudInitCandidate(contents []*proxmox.StorageContent, machineIdentity string) (string, bool, error) {
+	prefix := cloudInitStorageFilenamePrefix + machineIdentity + "-"
+	var candidate string
+	for _, content := range contents {
+		separator := strings.Index(content.Volid, ":iso/")
+		if separator < 1 {
+			continue
+		}
+		name := content.Volid[separator+len(":iso/"):]
+		if !strings.HasPrefix(name, prefix) {
+			continue
+		}
+		_, parsedVolID, err := ownedCloudInitVolume(content.Volid+",media=cdrom", machineIdentity)
+		if err != nil {
+			return "", false, err
+		}
+		if content.Format != cloudInitISOContentType {
+			return "", false, fmt.Errorf("owned cloud-init volume %q has unexpected format %q", parsedVolID, content.Format)
+		}
+		if candidate != "" {
+			return "", false, fmt.Errorf("multiple owned cloud-init volumes found for Machine %q", machineIdentity)
+		}
+		candidate = parsedVolID
+	}
+	return candidate, candidate != "", nil
 }
 
 func fileSHA256(path string) (string, uint64, error) {

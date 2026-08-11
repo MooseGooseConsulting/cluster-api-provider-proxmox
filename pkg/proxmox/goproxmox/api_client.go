@@ -353,39 +353,43 @@ func (c *APIClient) UnmountCloudInitISO(ctx context.Context, vm *proxmox.Virtual
 	if vm.VirtualMachineConfig == nil || device != "ide0" {
 		return fmt.Errorf("unable to prove mounted cloud-init device %q", device)
 	}
-	storageName, volID, err := ownedCloudInitVolume(vm.VirtualMachineConfig.IDE0, machineIdentity)
-	if err != nil {
-		return err
-	}
 	node, err := c.Node(ctx, vm.Node)
 	if err != nil {
 		return fmt.Errorf("get cloud-init node: %w", err)
 	}
-	storage, err := node.Storage(ctx, storageName)
-	if err != nil {
-		return fmt.Errorf("get cloud-init storage %q: %w", storageName, err)
-	}
-	present, err := inspectOwnedCloudInitVolume(ctx, storage, volID)
-	if err != nil {
-		return fmt.Errorf("inspect mounted cloud-init volume: %w", err)
-	}
 
-	unmountTask, err := vm.Config(ctx, proxmox.VirtualMachineOption{Name: device, Value: "none,media=cdrom"})
-	if err != nil {
-		return fmt.Errorf("unable to unmount cloud-init iso: %w", err)
-	}
-	if err := unmountTask.WaitFor(ctx, 2); err != nil {
-		return fmt.Errorf("wait for cloud-init unmount: %w", err)
-	}
-	if present {
-		deleteTask, deleted, err := deleteOwnedCloudInitVolume(ctx, storage, volID)
+	deviceValue := vm.VirtualMachineConfig.IDE0
+	var storage *proxmox.Storage
+	var volID string
+	if deviceValue == "" || deviceValue == "none,media=cdrom" {
+		storage, volID, err = recoverOwnedCloudInitVolume(ctx, node, machineIdentity)
 		if err != nil {
-			return fmt.Errorf("delete exact cloud-init volume %q: %w", volID, err)
+			return err
 		}
-		if deleted && deleteTask != nil {
-			if err := deleteTask.WaitFor(ctx, 2); err != nil {
-				return fmt.Errorf("wait for exact cloud-init volume deletion: %w", err)
-			}
+	} else {
+		storageName, mountedVolID, proofErr := ownedCloudInitVolume(deviceValue, machineIdentity)
+		if proofErr != nil {
+			return proofErr
+		}
+		storage, err = node.Storage(ctx, storageName)
+		if err != nil {
+			return fmt.Errorf("get cloud-init storage %q: %w", storageName, err)
+		}
+		if _, err := inspectOwnedCloudInitVolume(ctx, storage, mountedVolID); err != nil {
+			return fmt.Errorf("inspect mounted cloud-init volume: %w", err)
+		}
+		volID = mountedVolID
+		unmountTask, unmountErr := vm.Config(ctx, proxmox.VirtualMachineOption{Name: device, Value: "none,media=cdrom"})
+		if unmountErr != nil {
+			return fmt.Errorf("unable to unmount cloud-init iso: %w", unmountErr)
+		}
+		if err := unmountTask.WaitFor(ctx, 2); err != nil {
+			return fmt.Errorf("wait for cloud-init unmount: %w", err)
+		}
+	}
+	if storage != nil {
+		if _, err := deleteOwnedCloudInitVolume(ctx, storage, volID); err != nil {
+			return fmt.Errorf("delete exact cloud-init volume %q: %w", volID, err)
 		}
 	}
 
@@ -397,6 +401,40 @@ func (c *APIClient) UnmountCloudInitISO(ctx context.Context, vm *proxmox.Virtual
 		return removeTagTask.WaitFor(ctx, 2)
 	}
 	return nil
+}
+
+func recoverOwnedCloudInitVolume(ctx context.Context, node *proxmox.Node, machineIdentity string) (*proxmox.Storage, string, error) {
+	if _, err := cloudInitISOName(machineIdentity, strings.Repeat("0", cloudInitDigestLength)); err != nil {
+		return nil, "", err
+	}
+	storages, err := node.Storages(ctx)
+	if err != nil {
+		return nil, "", fmt.Errorf("list ISO storages for cloud-init recovery: %w", err)
+	}
+	var matchedStorage *proxmox.Storage
+	var matchedVolID string
+	for _, storage := range storages {
+		if storage.Enabled == 0 || !strings.Contains(storage.Content, "iso") {
+			continue
+		}
+		contents, err := storage.GetContent(ctx)
+		if err != nil {
+			return nil, "", fmt.Errorf("inspect ISO storage %q for cloud-init recovery: %w", storage.Name, err)
+		}
+		volID, found, err := ownedCloudInitCandidate(contents, machineIdentity)
+		if err != nil {
+			return nil, "", err
+		}
+		if !found {
+			continue
+		}
+		if matchedStorage != nil {
+			return nil, "", fmt.Errorf("multiple owned cloud-init volumes found for Machine %q", machineIdentity)
+		}
+		matchedStorage = storage
+		matchedVolID = volID
+	}
+	return matchedStorage, matchedVolID, nil
 }
 
 // CloudInitStatus returns the cloud-init status of the VM.
