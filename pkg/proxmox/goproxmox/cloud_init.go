@@ -233,6 +233,9 @@ func (c *APIClient) CloudInit(ctx context.Context, vm *proxmox.VirtualMachine, m
 		if err := waitForCloudInitEffect(ctx, uploadTask, 5, "cloud-init ISO upload", true, func() error {
 			return requireCloudInitISO(ctx, storage, storage.Name, isoName, size)
 		}); err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return fmt.Errorf("%w: cloud-init upload wait ended with reconciliation context: %w", capmox.ErrCloudInitUploadPending, ctxErr)
+			}
 			return err
 		}
 	}
@@ -240,8 +243,17 @@ func (c *APIClient) CloudInit(ctx context.Context, vm *proxmox.VirtualMachine, m
 	if err := recordCloudInitUpload(recorder, uploadState, "record completed cloud-init upload"); err != nil {
 		return err
 	}
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("%w: exact cloud-init upload is complete; defer mount after reconciliation cancellation: %w", capmox.ErrCloudInitUploadPending, err)
+	}
 
-	return mountCloudInitISO(ctx, vm, machineIdentity, device, expectedVolID)
+	if err := mountCloudInitISO(ctx, vm, machineIdentity, device, expectedVolID); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return fmt.Errorf("%w: cloud-init mount outcome requires successor reconciliation: %w", capmox.ErrCloudInitUploadPending, ctxErr)
+		}
+		return err
+	}
+	return nil
 }
 
 func (c *APIClient) prepareCloudInitAttempt(ctx context.Context, node *proxmox.Node, vm *proxmox.VirtualMachine, machineIdentity, device, isoName string, size uint64, current *capmox.CloudInitUpload, recorder capmox.CloudInitUploadRecorder) (uint64, bool, bool, error) {
@@ -327,6 +339,9 @@ func (c *APIClient) resumeCloudInitUpload(ctx context.Context, node *proxmox.Nod
 		}
 	}
 	if err := mountCloudInitISO(ctx, vm, machineIdentity, device, expectedVolID); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return true, false, fmt.Errorf("%w: resumed cloud-init mount outcome requires successor reconciliation: %w", capmox.ErrCloudInitUploadPending, ctxErr)
+		}
 		return true, false, err
 	}
 	return true, false, nil
@@ -674,8 +689,12 @@ func uploadCloudInitISO(ctx context.Context, storage cloudInitUploadStorage, sto
 		proofCtx, cancel = context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 	}
 	defer cancel()
-	if proofErr := requireCloudInitISO(proofCtx, storage, storageName, isoName, size); proofErr != nil {
+	present, proofErr := inspectCloudInitISO(proofCtx, storage, storageName, isoName, size)
+	if proofErr != nil {
 		return nil, false, fmt.Errorf("cloud-init ISO upload response was ambiguous (%w) and storage proof failed: %v", err, proofErr)
+	}
+	if !present {
+		return nil, false, fmt.Errorf("%w: cloud-init ISO upload response was ambiguous and exact volume %q is not yet visible: %w", capmox.ErrCloudInitUploadPending, fmt.Sprintf("%s:iso/%s", storageName, isoName), err)
 	}
 	return nil, true, nil
 }

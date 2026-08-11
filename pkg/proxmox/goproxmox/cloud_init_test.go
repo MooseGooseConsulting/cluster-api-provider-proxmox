@@ -185,6 +185,7 @@ func TestUploadCloudInitISOProof(t *testing.T) {
 		storage          *fakeCloudInitStorage
 		wantProven       bool
 		wantError        string
+		wantPending      bool
 		wantUploads      int
 		wantContentCalls int
 	}{
@@ -196,7 +197,7 @@ func TestUploadCloudInitISOProof(t *testing.T) {
 		{name: "pre-existing mismatch fails before dispatch", storage: &fakeCloudInitStorage{results: []storageResult{{contents: []*proxmox.StorageContent{mismatch}}}}, wantError: "preflight failed", wantUploads: 0, wantContentCalls: 1},
 		{name: "pre-existing duplicate fails before dispatch", storage: &fakeCloudInitStorage{results: []storageResult{{contents: []*proxmox.StorageContent{exact, exact}}}}, wantError: "duplicate volume", wantUploads: 0, wantContentCalls: 1},
 		{name: "reused VMID different Machine artifact cannot satisfy proof", storage: &fakeCloudInitStorage{uploadErr: ambiguousEOF, results: []storageResult{{contents: []*proxmox.StorageContent{otherMachine}}, {contents: []*proxmox.StorageContent{otherMachine}}}}, wantError: "exact volume", wantUploads: 1, wantContentCalls: 2},
-		{name: "ambiguous response with artifact absent remains failure", storage: &fakeCloudInitStorage{uploadErr: ambiguousEOF, results: []storageResult{{}, {}}}, wantError: "exact volume", wantUploads: 1, wantContentCalls: 2},
+		{name: "ambiguous response with artifact absent remains retryable", storage: &fakeCloudInitStorage{uploadErr: ambiguousEOF, results: []storageResult{{}, {}}}, wantError: "not yet visible", wantPending: true, wantUploads: 1, wantContentCalls: 2},
 		{name: "ambiguous response with metadata mismatch remains failure", storage: &fakeCloudInitStorage{uploadErr: ambiguousEOF, results: []storageResult{{}, {contents: []*proxmox.StorageContent{mismatch}}}}, wantError: "metadata mismatched", wantUploads: 1, wantContentCalls: 2},
 		{name: "authoritative HTTP rejection remains failure without post-dispatch proof", storage: &fakeCloudInitStorage{uploadErr: errors.New("500 Internal Server Error"), results: []storageResult{{}}}, wantError: "500 Internal Server Error", wantUploads: 1, wantContentCalls: 1},
 	}
@@ -208,6 +209,9 @@ func TestUploadCloudInitISOProof(t *testing.T) {
 				require.NoError(t, err)
 			} else {
 				require.ErrorContains(t, err, test.wantError)
+			}
+			if test.wantPending {
+				require.ErrorIs(t, err, capmox.ErrCloudInitUploadPending)
 			}
 			require.Equal(t, test.wantProven, proven)
 			require.Equal(t, test.wantUploads, test.storage.uploadCalls)
@@ -830,6 +834,107 @@ func TestCloudInitResumesAcceptedUploadWithoutRedispatch(t *testing.T) {
 	require.Equal(t, string(uploadUPID), recorded[0].UPID)
 	require.Equal(t, 1, mountCalls)
 	require.Zero(t, httpmock.GetCallCountInfo()["POST =~/nodes/pve/storage/local/upload$"], "restart replay must not dispatch a second upload")
+}
+
+func TestCloudInitCancellationDefersRecoveryAndMountToSuccessor(t *testing.T) {
+	for _, test := range []struct {
+		name               string
+		visibleDuringProof bool
+		wantFirstPhase     string
+	}{
+		{name: "accepted upload visibility is delayed", visibleDuringProof: false, wantFirstPhase: capmox.CloudInitUploadPhaseDispatching},
+		{name: "accepted upload is proven before cancellation returns", visibleDuringProof: true, wantFirstPhase: capmox.CloudInitUploadPhaseComplete},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			client := newTestClient(t)
+			const (
+				userdata      = "user-data"
+				metadata      = "meta-data"
+				networkConfig = "network-data"
+			)
+			isoPath, err := makeCloudInitISO(userdata, metadata, "", networkConfig)
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = os.Remove(isoPath) })
+			_, size, err := fileSHA256(isoPath)
+			require.NoError(t, err)
+			isoName, err := cloudInitISOName("machine-uid", cloudInitBootstrapDigest(userdata, metadata, "", networkConfig))
+			require.NoError(t, err)
+			expectedVolID := "local:iso/" + isoName
+
+			cloudInitTag := proxmox.MakeTag(proxmox.TagCloudInit)
+			vmConfig := &proxmox.VirtualMachineConfig{IDE0: cloudInitUnmountedDeviceValue, Tags: cloudInitTag, TagsSlice: []string{cloudInitTag}}
+			vm := &proxmox.VirtualMachine{Node: "pve", VMID: 320, VirtualMachineConfig: vmConfig}
+			vm.New(client.Client, "pve", 320)
+			httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve/status$`,
+				httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": proxmox.Node{Name: "pve"}}))
+			httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve/storage$`,
+				httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": &proxmox.Storages{{Name: "local", Content: "iso", Enabled: 1, Avail: 1 << 30}}}))
+			httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve/storage/local/status$`,
+				httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": proxmox.Storage{Name: "local", Content: "iso", Enabled: 1, Avail: 1 << 30}}))
+
+			artifactVisible := false
+			httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve/storage/local/content$`, func(*http.Request) (*http.Response, error) {
+				contents := []*proxmox.StorageContent{}
+				if artifactVisible {
+					contents = append(contents, &proxmox.StorageContent{Volid: expectedVolID, Format: "iso", Size: size})
+				}
+				return httpmock.NewJsonResponse(200, map[string]any{"data": contents})
+			})
+			ctx, cancel := context.WithCancel(context.Background())
+			uploadCalls := 0
+			httpmock.RegisterResponder(http.MethodPost, `=~/nodes/pve/storage/local/upload$`, func(*http.Request) (*http.Response, error) {
+				uploadCalls++
+				artifactVisible = test.visibleDuringProof
+				cancel()
+				return nil, context.Canceled
+			})
+
+			mountUPID := proxmox.UPID("UPID:pve:1:2:3:qmconfig:320:root@pam:")
+			mountCalls := 0
+			httpmock.RegisterResponder(http.MethodPost, `=~/nodes/pve/qemu/320/config$`, func(request *http.Request) (*http.Response, error) {
+				mountCalls++
+				config := map[string]string{}
+				require.NoError(t, json.NewDecoder(request.Body).Decode(&config))
+				vmConfig.IDE0 = config[cloudInitDevice]
+				return httpmock.NewJsonResponse(200, map[string]any{"data": mountUPID})
+			})
+			httpmock.RegisterResponder(http.MethodGet, fmt.Sprintf(`=~/nodes/pve/tasks/%s/status$`, string(mountUPID)),
+				httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": proxmox.Task{UPID: mountUPID, Node: "pve", Status: "stopped", ExitStatus: "OK"}}))
+			httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve/qemu/320/status/current$`,
+				httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": proxmox.VirtualMachine{Node: "pve", VMID: 320}}))
+			httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve/qemu/320/config$`, func(*http.Request) (*http.Response, error) {
+				return httpmock.NewJsonResponse(200, map[string]any{"data": vmConfig})
+			})
+
+			var durable capmox.CloudInitUpload
+			recorder := func(upload capmox.CloudInitUpload) error {
+				durable = upload
+				return nil
+			}
+			err = client.CloudInit(ctx, vm, "machine-uid", cloudInitDevice, userdata, metadata, "", networkConfig, nil, recorder)
+			require.ErrorIs(t, err, capmox.ErrCloudInitUploadPending)
+			require.ErrorIs(t, err, context.Canceled)
+			require.Equal(t, test.wantFirstPhase, durable.Phase)
+			require.Equal(t, 1, uploadCalls)
+			require.Zero(t, mountCalls, "cancelled leader must never mount")
+
+			artifactVisible = true
+			if durable.Phase == capmox.CloudInitUploadPhaseDispatching {
+				originalNow := cloudInitDispatchNow
+				expiredAt := durable.LeaseUntilUnix + 1
+				cloudInitDispatchNow = func() time.Time { return time.Unix(expiredAt, 0) }
+				t.Cleanup(func() { cloudInitDispatchNow = originalNow })
+				httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve/tasks\?limit=1&source=active&typefilter=imgcopy$`,
+					httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": []*proxmox.Task{}}))
+			}
+			err = client.CloudInit(context.Background(), vm, "machine-uid", cloudInitDevice, userdata, metadata, "", networkConfig, &durable, recorder)
+			require.NoError(t, err)
+			require.Equal(t, capmox.CloudInitUploadPhaseComplete, durable.Phase)
+			require.Equal(t, 1, uploadCalls, "successor must recover without redispatch")
+			require.Equal(t, 1, mountCalls)
+			require.Equal(t, expectedVolID+",media=cdrom", vmConfig.IDE0)
+		})
+	}
 }
 
 func TestCloudInitRearmsQuiescentIntentAndDispatchesExactlyOnce(t *testing.T) {
