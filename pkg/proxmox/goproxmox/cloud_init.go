@@ -44,6 +44,7 @@ const (
 	maxPVEStorageFilenameLength    = 255
 	cloudInitStorageFilenamePrefix = "user-data-"
 	cloudInitUnmountedDeviceValue  = "none,media=cdrom"
+	cloudInitDevice                = "ide0"
 )
 
 var waitForCloudInitTask = func(ctx context.Context, task *proxmox.Task, attempts int) error {
@@ -157,7 +158,7 @@ func validateCloudInitTargetDevice(vm *proxmox.VirtualMachine, machineIdentity, 
 }
 
 func cloudInitDeviceValue(vm *proxmox.VirtualMachine, device string) string {
-	if vm.VirtualMachineConfig == nil || device != "ide0" {
+	if vm.VirtualMachineConfig == nil || device != cloudInitDevice {
 		return ""
 	}
 	return vm.VirtualMachineConfig.IDE0
@@ -472,7 +473,7 @@ func cloudInitConfigOptions(vm *proxmox.VirtualMachine, device, volID string) []
 }
 
 func cloudInitMountIsExact(vm *proxmox.VirtualMachine, machineIdentity, device, expectedVolID string) (bool, error) {
-	if vm.VirtualMachineConfig == nil || device != "ide0" {
+	if vm.VirtualMachineConfig == nil || device != cloudInitDevice {
 		return false, fmt.Errorf("unable to prove cloud-init mount device %q", device)
 	}
 	deviceValue := vm.VirtualMachineConfig.IDE0
