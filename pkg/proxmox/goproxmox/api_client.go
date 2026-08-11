@@ -230,6 +230,11 @@ func (c *APIClient) DeleteVM(ctx context.Context, nodeName string, vmID int64, m
 		return nil, fmt.Errorf("cannot get cluster")
 	}
 
+	if upload != nil && upload.Phase != capmox.CloudInitUploadPhaseComplete {
+		if err := c.reconcileRecordedCloudInitUpload(ctx, node, machineIdentity, upload); err != nil {
+			return nil, fmt.Errorf("cannot reconcile recorded cloud-init upload before deleting vm id %d: %w", vmID, err)
+		}
+	}
 	if vmidFree, err := cluster.CheckID(ctx, int(vmID)); vmidFree {
 		if err := c.reconcileRecordedCloudInitUpload(ctx, node, machineIdentity, upload); err != nil {
 			return nil, fmt.Errorf("cannot reconcile recorded cloud-init upload for absent vm id %d: %w", vmID, err)
@@ -446,22 +451,28 @@ func (c *APIClient) UnmountCloudInitISO(ctx context.Context, vm *proxmox.Virtual
 	} else {
 		storageName, mountedVolID, proofErr := ownedCloudInitVolume(deviceValue, machineIdentity)
 		if proofErr != nil {
-			return proofErr
-		}
-		storage, err = node.Storage(ctx, storageName)
-		if err != nil {
-			return fmt.Errorf("get cloud-init storage %q: %w", storageName, err)
-		}
-		if _, err := inspectOwnedCloudInitVolume(ctx, storage, mountedVolID); err != nil {
-			return fmt.Errorf("inspect mounted cloud-init volume: %w", err)
-		}
-		volID = mountedVolID
-		unmountTask, unmountErr := vm.Config(ctx, proxmox.VirtualMachineOption{Name: device, Value: cloudInitUnmountedDeviceValue})
-		if unmountErr != nil {
-			return fmt.Errorf("unable to unmount cloud-init iso: %w", unmountErr)
-		}
-		if err := unmountTask.WaitFor(ctx, 2); err != nil {
-			return fmt.Errorf("wait for cloud-init unmount: %w", err)
+			// A foreign target device is outside CAPMOX authority. Preserve it, but
+			// still recover and delete the sole unattached Machine-owned artifact.
+			storage, volID, err = recoverOwnedCloudInitVolume(ctx, node, machineIdentity)
+			if err != nil {
+				return fmt.Errorf("recover unattached cloud-init artifact while preserving foreign device: %w", err)
+			}
+		} else {
+			storage, err = node.Storage(ctx, storageName)
+			if err != nil {
+				return fmt.Errorf("get cloud-init storage %q: %w", storageName, err)
+			}
+			if _, err := inspectOwnedCloudInitVolume(ctx, storage, mountedVolID); err != nil {
+				return fmt.Errorf("inspect mounted cloud-init volume: %w", err)
+			}
+			volID = mountedVolID
+			unmountTask, unmountErr := vm.Config(ctx, proxmox.VirtualMachineOption{Name: device, Value: cloudInitUnmountedDeviceValue})
+			if unmountErr != nil {
+				return fmt.Errorf("unable to unmount cloud-init iso: %w", unmountErr)
+			}
+			if err := unmountTask.WaitFor(ctx, 2); err != nil {
+				return fmt.Errorf("wait for cloud-init unmount: %w", err)
+			}
 		}
 	}
 	if storage != nil {

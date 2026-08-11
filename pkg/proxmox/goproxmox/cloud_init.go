@@ -24,6 +24,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
+	"net/url"
 	"os"
 	"strings"
 
@@ -82,6 +84,9 @@ func (c *APIClient) CloudInit(ctx context.Context, vm *proxmox.VirtualMachine, m
 	if err != nil {
 		return err
 	}
+	if err := validateCloudInitTargetDevice(vm, machineIdentity, device); err != nil {
+		return err
+	}
 	// The tag is the durable pre-mount ownership marker. Applying it before the
 	// upload lets deletion distinguish a clean, untagged VM from a failed
 	// provisioning attempt that may own an unattached immutable artifact.
@@ -89,12 +94,18 @@ func (c *APIClient) CloudInit(ctx context.Context, vm *proxmox.VirtualMachine, m
 		return err
 	}
 
-	storage, err := findCloudInitUploadTarget(ctx, node, machineIdentity, isoName, size)
+	selection, err := findCloudInitUploadTarget(ctx, node, machineIdentity, isoName, size)
 	if err != nil {
 		return fmt.Errorf("find exact cloud-init ISO upload target on node %q: %w", vm.Node, err)
 	}
+	expectedVolID := fmt.Sprintf("%s:iso/%s", selection.storage.Name, isoName)
+	if selection.supersededStorage != nil {
+		if err := c.reconcileSupersededCloudInitArtifact(ctx, vm, machineIdentity, device, expectedVolID, selection.supersededStorage, selection.supersededVolID); err != nil {
+			return err
+		}
+	}
+	storage := selection.storage
 
-	expectedVolID := fmt.Sprintf("%s:iso/%s", storage.Name, isoName)
 	uploadState := capmox.CloudInitUpload{
 		Version: 1,
 		Node:    vm.Node,
@@ -134,6 +145,24 @@ func (c *APIClient) CloudInit(ctx context.Context, vm *proxmox.VirtualMachine, m
 	return mountCloudInitISO(ctx, vm, machineIdentity, device, expectedVolID)
 }
 
+func validateCloudInitTargetDevice(vm *proxmox.VirtualMachine, machineIdentity, device string) error {
+	deviceValue := cloudInitDeviceValue(vm, device)
+	if deviceValue == "" || deviceValue == cloudInitUnmountedDeviceValue {
+		return nil
+	}
+	if _, _, err := ownedCloudInitVolume(deviceValue, machineIdentity); err != nil {
+		return fmt.Errorf("cloud-init target device %q is occupied by foreign state: %w", device, err)
+	}
+	return nil
+}
+
+func cloudInitDeviceValue(vm *proxmox.VirtualMachine, device string) string {
+	if vm.VirtualMachineConfig == nil || device != "ide0" {
+		return ""
+	}
+	return vm.VirtualMachineConfig.IDE0
+}
+
 func mountCloudInitISO(ctx context.Context, vm *proxmox.VirtualMachine, machineIdentity, device, expectedVolID string) error {
 	mounted, err := cloudInitMountIsExact(vm, machineIdentity, device, expectedVolID)
 	if err != nil {
@@ -146,7 +175,7 @@ func mountCloudInitISO(ctx context.Context, vm *proxmox.VirtualMachine, machineI
 	options := cloudInitConfigOptions(vm, device, expectedVolID)
 	configTask, err := vm.Config(ctx, options...)
 	if err != nil {
-		if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+		if !isAmbiguousTransportError(err) {
 			return err
 		}
 		if proofErr := requireCloudInitMount(ctx, vm, machineIdentity, device, expectedVolID); proofErr != nil {
@@ -159,7 +188,13 @@ func mountCloudInitISO(ctx context.Context, vm *proxmox.VirtualMachine, machineI
 	})
 }
 
-func findCloudInitUploadTarget(ctx context.Context, node *proxmox.Node, machineIdentity, isoName string, size uint64) (*proxmox.Storage, error) {
+type cloudInitUploadSelection struct {
+	storage           *proxmox.Storage
+	supersededStorage *proxmox.Storage
+	supersededVolID   string
+}
+
+func findCloudInitUploadTarget(ctx context.Context, node *proxmox.Node, machineIdentity, isoName string, size uint64) (*cloudInitUploadSelection, error) {
 	storages, err := node.Storages(ctx)
 	if err != nil {
 		return nil, err
@@ -208,18 +243,41 @@ func findCloudInitUploadTarget(ctx context.Context, node *proxmox.Node, machineI
 			matched = storage
 		}
 	}
-	if supersededStorage != nil {
-		if _, err := deleteOwnedCloudInitVolume(ctx, supersededStorage, supersededVolID); err != nil {
-			return nil, fmt.Errorf("delete superseded cloud-init artifact %q: %w", supersededVolID, err)
-		}
-	}
 	if matched != nil {
-		return matched, nil
+		return &cloudInitUploadSelection{storage: matched, supersededStorage: supersededStorage, supersededVolID: supersededVolID}, nil
 	}
 	if eligible == nil {
 		return nil, errors.New("no enabled ISO storage found")
 	}
-	return eligible, nil
+	return &cloudInitUploadSelection{storage: eligible, supersededStorage: supersededStorage, supersededVolID: supersededVolID}, nil
+}
+
+func (c *APIClient) reconcileSupersededCloudInitArtifact(ctx context.Context, vm *proxmox.VirtualMachine, machineIdentity, device, expectedVolID string, storage *proxmox.Storage, supersededVolID string) error {
+	deviceValue := cloudInitDeviceValue(vm, device)
+	if deviceValue != "" && deviceValue != cloudInitUnmountedDeviceValue {
+		_, mountedVolID, err := ownedCloudInitVolume(deviceValue, machineIdentity)
+		if err != nil {
+			return fmt.Errorf("cannot reconcile superseded cloud-init artifact while target device is foreign: %w", err)
+		}
+		switch mountedVolID {
+		case supersededVolID:
+			if err := c.UnmountCloudInitISO(ctx, vm, machineIdentity, device); err != nil {
+				return fmt.Errorf("unmount superseded cloud-init artifact %q: %w", supersededVolID, err)
+			}
+			if err := addCloudInitOwnershipTag(ctx, vm); err != nil {
+				return fmt.Errorf("restore cloud-init ownership tag after superseded cleanup: %w", err)
+			}
+			return nil
+		case expectedVolID:
+			// The superseded artifact is unattached; delete it below.
+		default:
+			return fmt.Errorf("cloud-init device mounts %q while reconciling superseded volume %q", mountedVolID, supersededVolID)
+		}
+	}
+	if _, err := deleteOwnedCloudInitVolume(ctx, storage, supersededVolID); err != nil {
+		return fmt.Errorf("delete unattached superseded cloud-init artifact %q: %w", supersededVolID, err)
+	}
+	return nil
 }
 
 func addCloudInitOwnershipTag(ctx context.Context, vm *proxmox.VirtualMachine) error {
@@ -231,9 +289,25 @@ func addCloudInitOwnershipTag(ctx context.Context, vm *proxmox.VirtualMachine) e
 		if tagTask == nil {
 			return errors.New("cloud-init ownership tag returned no task")
 		}
-		if err := waitForCloudInitTask(ctx, tagTask, 2); err != nil {
-			return fmt.Errorf("wait for cloud-init ownership tag: %w", err)
+		waitErr := waitForCloudInitTask(ctx, tagTask, 2)
+		if tagTask.IsFailed || (tagTask.ExitStatus != "" && tagTask.ExitStatus != "OK") {
+			return fmt.Errorf("cloud-init ownership tag task failed with exit status %q", tagTask.ExitStatus)
 		}
+		if waitErr != nil {
+			if proofErr := requireCloudInitOwnershipTag(ctx, vm); proofErr != nil {
+				return fmt.Errorf("cloud-init ownership tag task wait was ambiguous (%w) and exact tag proof failed: %v", waitErr, proofErr)
+			}
+		}
+	}
+	return nil
+}
+
+func requireCloudInitOwnershipTag(ctx context.Context, vm *proxmox.VirtualMachine) error {
+	if err := vm.Ping(ctx); err != nil {
+		return fmt.Errorf("refetch VM config: %w", err)
+	}
+	if !vm.HasTag(proxmox.MakeTag(proxmox.TagCloudInit)) {
+		return errors.New("cloud-init ownership tag is absent")
 	}
 	return nil
 }
@@ -309,7 +383,7 @@ func uploadCloudInitISO(ctx context.Context, storage cloudInitStorage, storageNa
 	if err == nil {
 		return task, false, nil
 	}
-	if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+	if !isAmbiguousTransportError(err) {
 		return nil, false, err
 	}
 
@@ -317,6 +391,18 @@ func uploadCloudInitISO(ctx context.Context, storage cloudInitStorage, storageNa
 		return nil, false, fmt.Errorf("cloud-init ISO upload response was ambiguous (%w) and storage proof failed: %v", err, proofErr)
 	}
 	return nil, true, nil
+}
+
+func isAmbiguousTransportError(err error) bool {
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr)
 }
 
 func requireCloudInitISO(ctx context.Context, storage cloudInitStorage, storageName, isoName string, size uint64) error {
@@ -365,6 +451,9 @@ func vmBootOrder(vm *proxmox.VirtualMachine) string {
 func appendBootDevice(existing, device string) string {
 	if existing == "" {
 		return ""
+	}
+	if !strings.HasPrefix(existing, "order=") {
+		return existing
 	}
 	for index, entry := range strings.Split(existing, ";") {
 		if entry == device || (index == 0 && strings.TrimPrefix(entry, "order=") == device) {

@@ -737,6 +737,107 @@ func TestDeleteVMWaitsForRecordedUploadThenCleansLateArtifact(t *testing.T) {
 	require.False(t, artifactPresent)
 }
 
+func TestDeleteVMPresentWaitsForRecordedUploadThenCleansBeforeDeletion(t *testing.T) {
+	client := newTestClient(t)
+	uploadUPID := "UPID:test:000D6BDA:041E0A54:654A5A1D:imgcopy:local:root@pam:"
+	storageDeleteUPID := "UPID:test:000D6BDB:041E0A55:654A5A1E:imgdel:local:root@pam:"
+	tagUPID := "UPID:test:000D6BDC:041E0A56:654A5A1F:qmconfig:320:root@pam:"
+	vmDeleteUPID := "UPID:test:000D6BDD:041E0A57:654A5A20:qmdestroy:320:root@pam:"
+	digest := cloudInitBootstrapDigest("late", "metadata", "", "network")
+	isoName := "user-data-machine-uid-" + digest + ".iso"
+	volID := "local:iso/" + isoName
+	upload := &capmox.CloudInitUpload{
+		Version: 1,
+		Node:    "test",
+		Storage: "local",
+		VolID:   volID,
+		Size:    4096,
+		UPID:    uploadUPID,
+		Phase:   capmox.CloudInitUploadPhaseAccepted,
+	}
+
+	uploadRunning := true
+	artifactPresent := false
+	storageDeleteCalls := 0
+	tagRemovalCalls := 0
+	vmDeleteCalls := 0
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/test/status$`,
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": proxmox.Node{Name: "test"}}))
+	httpmock.RegisterResponder(http.MethodGet, `=~/cluster/status$`,
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": proxmox.NodeStatuses{{Name: "test"}}}))
+	httpmock.RegisterResponder(http.MethodGet, `=~/cluster/nextid$`,
+		httpmock.NewJsonResponderOrPanic(400, map[string]any{"data": fmt.Sprintf("VM %d already exists", 320)}))
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/test/tasks/`+uploadUPID+`/status$`, func(*http.Request) (*http.Response, error) {
+		task := proxmox.Task{UPID: proxmox.UPID(uploadUPID), Node: "test", Status: "running", IsRunning: true}
+		if !uploadRunning {
+			task.Status = "stopped"
+			task.ExitStatus = "OK"
+			task.IsRunning = false
+		}
+		return httpmock.NewJsonResponse(200, map[string]any{"data": task})
+	})
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/test/storage/local/status$`,
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": proxmox.Storage{Name: "local", Content: "iso", Enabled: 1}}))
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/test/storage$`,
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": &proxmox.Storages{{Name: "local", Content: "iso", Enabled: 1}}}))
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/test/storage/local/content$`, func(*http.Request) (*http.Response, error) {
+		contents := []*proxmox.StorageContent{}
+		if artifactPresent {
+			contents = append(contents, &proxmox.StorageContent{Volid: volID, Format: "iso", Size: 4096})
+		}
+		return httpmock.NewJsonResponse(200, map[string]any{"data": contents})
+	})
+	httpmock.RegisterResponder(http.MethodDelete, `=~/nodes/test/storage/local/content/.*$`, func(*http.Request) (*http.Response, error) {
+		storageDeleteCalls++
+		artifactPresent = false
+		return httpmock.NewJsonResponse(200, map[string]any{"data": storageDeleteUPID})
+	})
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/test/tasks/`+storageDeleteUPID+`/status$`,
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": proxmox.Task{UPID: proxmox.UPID(storageDeleteUPID), Node: "test", Status: "stopped", ExitStatus: "OK"}}))
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/test/qemu/320/status/current$`,
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": proxmox.VirtualMachine{Node: "test", VMID: 320}}))
+	cloudInitTag := proxmox.MakeTag(proxmox.TagCloudInit)
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/test/qemu/320/config$`,
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": proxmox.VirtualMachineConfig{
+			IDE0: cloudInitUnmountedDeviceValue, Tags: cloudInitTag, TagsSlice: []string{cloudInitTag},
+		}}))
+	httpmock.RegisterResponder(http.MethodPost, `=~/nodes/test/qemu/320/config$`, func(*http.Request) (*http.Response, error) {
+		tagRemovalCalls++
+		return httpmock.NewJsonResponse(200, map[string]any{"data": tagUPID})
+	})
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/test/tasks/`+tagUPID+`/status$`,
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": proxmox.Task{UPID: proxmox.UPID(tagUPID), Node: "test", Status: "stopped", ExitStatus: "OK"}}))
+	httpmock.RegisterResponder(http.MethodDelete, `=~/nodes/test/qemu/320$`, func(*http.Request) (*http.Response, error) {
+		vmDeleteCalls++
+		return httpmock.NewJsonResponse(200, map[string]any{"data": vmDeleteUPID})
+	})
+
+	originalWait := waitForCloudInitTask
+	waitForCloudInitTask = func(_ context.Context, task *proxmox.Task, _ int) error {
+		if task.IsRunning {
+			return errors.New("task still running")
+		}
+		return nil
+	}
+	t.Cleanup(func() { waitForCloudInitTask = originalWait })
+
+	_, err := client.DeleteVM(context.Background(), "test", 320, "machine-uid", upload)
+	require.ErrorContains(t, err, "is not terminal")
+	require.Zero(t, storageDeleteCalls)
+	require.Zero(t, tagRemovalCalls, "ownership marker must remain while a recorded upload can still materialize")
+	require.Zero(t, vmDeleteCalls, "VM deletion must wait for recorded upload reconciliation")
+
+	uploadRunning = false
+	artifactPresent = true
+	task, err := client.DeleteVM(context.Background(), "test", 320, "machine-uid", upload)
+	require.NoError(t, err)
+	require.Equal(t, "qmdestroy", task.Type)
+	require.Equal(t, 1, storageDeleteCalls)
+	require.Equal(t, 1, tagRemovalCalls)
+	require.Equal(t, 1, vmDeleteCalls)
+	require.False(t, artifactPresent)
+}
+
 func TestProxmoxAPIClient_GetTask(t *testing.T) {
 	// "UPID:$node:$pid:$pstart:$startime:$dtype:$id:$user"
 	upid := "UPID:test:000D6BDA:041E0A54:654A5A1D:qmdestroy:101:root@pam:"
