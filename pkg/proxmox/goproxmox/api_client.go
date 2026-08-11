@@ -250,6 +250,16 @@ func (c *APIClient) DeleteVM(ctx context.Context, nodeName string, vmID int64, m
 		if err := c.UnmountCloudInitISO(ctx, vm, machineIdentity, "ide0"); err != nil {
 			return nil, fmt.Errorf("cannot clean cloud-init ISO before deleting vm id %d: %w", vmID, err)
 		}
+	} else {
+		storage, volID, cleanupErr := recoverOwnedCloudInitVolume(ctx, node, machineIdentity)
+		if cleanupErr != nil {
+			return nil, fmt.Errorf("cannot recover untagged cloud-init ISO before deleting vm id %d: %w", vmID, cleanupErr)
+		}
+		if storage != nil {
+			if _, cleanupErr := deleteOwnedCloudInitVolume(ctx, storage, volID); cleanupErr != nil {
+				return nil, fmt.Errorf("cannot delete untagged cloud-init ISO before deleting vm id %d: %w", vmID, cleanupErr)
+			}
+		}
 	}
 
 	task, err := vm.Delete(ctx)
@@ -419,12 +429,9 @@ func recoverOwnedCloudInitVolume(ctx context.Context, node *proxmox.Node, machin
 	var matchedStorage *proxmox.Storage
 	var matchedVolID string
 	for _, storage := range storages {
-		if storage.Enabled == 0 || !storageSupportsContent(storage.Content, cloudInitISOContentType) {
-			continue
-		}
 		contents, err := storage.GetContent(ctx)
 		if err != nil {
-			return nil, "", fmt.Errorf("inspect ISO storage %q for cloud-init recovery: %w", storage.Name, err)
+			return nil, "", fmt.Errorf("inspect storage %q for cloud-init recovery: %w", storage.Name, err)
 		}
 		volID, found, err := ownedCloudInitCandidate(contents, machineIdentity)
 		if err != nil {

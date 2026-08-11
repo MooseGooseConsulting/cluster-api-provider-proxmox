@@ -77,9 +77,9 @@ func (c *APIClient) CloudInit(ctx context.Context, vm *proxmox.VirtualMachine, m
 	if err != nil {
 		return err
 	}
-	storage, err := node.StorageISO(ctx)
+	storage, err := findCloudInitUploadTarget(ctx, node, isoName, size)
 	if err != nil {
-		return err
+		return fmt.Errorf("find exact cloud-init ISO upload target on node %q: %w", vm.Node, err)
 	}
 
 	uploadTask, proven, err := uploadCloudInitISO(ctx, storage, storage.Name, isoPath, isoName, digest, size)
@@ -105,6 +105,47 @@ func (c *APIClient) CloudInit(ctx context.Context, vm *proxmox.VirtualMachine, m
 		return err
 	}
 	return configTask.WaitFor(ctx, 2)
+}
+
+func findCloudInitUploadTarget(ctx context.Context, node *proxmox.Node, isoName string, size uint64) (*proxmox.Storage, error) {
+	storages, err := node.Storages(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var eligible *proxmox.Storage
+	var matched *proxmox.Storage
+	for _, storage := range storages {
+		if storage.Enabled != 0 && storageSupportsContent(storage.Content, cloudInitISOContentType) && eligible == nil {
+			eligible = storage
+		}
+		contents, err := storage.GetContent(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("inspect storage %q before cloud-init upload: %w", storage.Name, err)
+		}
+		expectedVolID := fmt.Sprintf("%s:iso/%s", storage.Name, isoName)
+		for _, content := range contents {
+			if content.Volid != expectedVolID {
+				continue
+			}
+			if matched != nil {
+				return nil, fmt.Errorf("exact cloud-init artifact %q exists on multiple storages", isoName)
+			}
+			if content.Format != cloudInitISOContentType || content.Size != size {
+				return nil, fmt.Errorf("volume %q metadata mismatched: format=%q size=%d expected_size=%d", expectedVolID, content.Format, content.Size, size)
+			}
+			if storage.Enabled == 0 || !storageSupportsContent(storage.Content, cloudInitISOContentType) {
+				return nil, fmt.Errorf("exact cloud-init artifact %q exists on ineligible storage %q", isoName, storage.Name)
+			}
+			matched = storage
+		}
+	}
+	if matched != nil {
+		return matched, nil
+	}
+	if eligible == nil {
+		return nil, errors.New("no enabled ISO storage found")
+	}
+	return eligible, nil
 }
 
 func addCloudInitOwnershipTag(ctx context.Context, vm *proxmox.VirtualMachine) error {

@@ -528,6 +528,10 @@ func TestCloudInitRecoveredUploadTagsMountsAndPreservesBoot(t *testing.T) {
 		}
 		return httpmock.NewJsonResponse(200, map[string]any{"data": contents})
 	})
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve/storage/disabled/content$`,
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": []*proxmox.StorageContent{}}))
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve/storage/backup/content$`,
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": []*proxmox.StorageContent{}}))
 
 	upid := proxmox.UPID("UPID:pve:003B4235:1DF4ABCA:667C1C45:qmconfig:320:root@pam:")
 	var mounted, boot string
@@ -549,7 +553,7 @@ func TestCloudInitRecoveredUploadTagsMountsAndPreservesBoot(t *testing.T) {
 	err = client.CloudInit(context.Background(), vm, "machine-uid", "ide0", "user-data", "meta-data", "", "network-data")
 	require.NoError(t, err)
 	require.Equal(t, 1, uploadCalls)
-	require.Equal(t, 2, contentCalls)
+	require.Equal(t, 3, contentCalls)
 	require.Equal(t, 2, configCalls, "recovered upload must tag and then mount the ISO")
 	require.True(t, vm.HasTag(proxmox.MakeTag(proxmox.TagCloudInit)))
 	require.Equal(t, "sha256", uploadedAlgorithm)
@@ -587,6 +591,50 @@ func TestRecoverOwnedCloudInitVolumeRejectsCrossStorageDuplicates(t *testing.T) 
 
 	_, _, err = recoverOwnedCloudInitVolume(context.Background(), node, "machine-uid")
 	require.ErrorContains(t, err, "multiple owned")
+}
+
+func TestFindCloudInitUploadTargetReusesExactArtifactAcrossStorageOrderDrift(t *testing.T) {
+	client := newTestClient(t)
+	digest := strings.Repeat("a", cloudInitDigestLength)
+	isoName, err := cloudInitISOName("machine-uid", digest)
+	require.NoError(t, err)
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve/status$`,
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": proxmox.Node{Name: "pve"}}))
+	node, err := client.Node(context.Background(), "pve")
+	require.NoError(t, err)
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve/storage$`,
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": &proxmox.Storages{
+			{Name: "new-first", Content: "iso", Enabled: 1},
+			{Name: "original", Content: "iso", Enabled: 1},
+		}}))
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve/storage/new-first/content$`,
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": []*proxmox.StorageContent{}}))
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve/storage/original/content$`,
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": []*proxmox.StorageContent{{
+			Volid: "original:iso/" + isoName, Format: "iso", Size: 4096,
+		}}}))
+
+	storage, err := findCloudInitUploadTarget(context.Background(), node, isoName, 4096)
+	require.NoError(t, err)
+	require.Equal(t, "original", storage.Name, "retry must reuse the existing exact artifact rather than the new first eligible storage")
+}
+
+func TestRecoverOwnedCloudInitVolumeRetainsStateWhenStorageCannotBeInspected(t *testing.T) {
+	client := newTestClient(t)
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve/status$`,
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": proxmox.Node{Name: "pve"}}))
+	node, err := client.Node(context.Background(), "pve")
+	require.NoError(t, err)
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve/storage$`,
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": &proxmox.Storages{
+			{Name: "disabled", Content: "iso", Enabled: 0},
+			{Name: "backup", Content: "backup", Enabled: 1},
+		}}))
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve/storage/disabled/content$`,
+		httpmock.NewJsonResponderOrPanic(500, map[string]any{"data": nil}))
+
+	_, _, err = recoverOwnedCloudInitVolume(context.Background(), node, "machine-uid")
+	require.ErrorContains(t, err, "inspect storage")
 }
 
 func TestUnmountCloudInitISOAcceptsNormalizedMountAndRecoversAfterTagFailure(t *testing.T) {

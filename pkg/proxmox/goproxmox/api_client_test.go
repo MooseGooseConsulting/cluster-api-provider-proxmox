@@ -556,7 +556,6 @@ func TestProxmoxAPIClient_DeleteVM(t *testing.T) {
 
 			// "UPID:$node:$pid:$pstart:$startime:$dtype:$id:$user"
 			upid := "UPID:test:000D6BDA:041E0A54:654A5A1D:qmdestroy:101:root@pam:"
-			cloudInitTag := proxmox.MakeTag(proxmox.TagCloudInit)
 			logicalDigest := cloudInitBootstrapDigest("delete-before-ready", "metadata", "", "network")
 			volID := "local:iso/user-data-machine-uid-" + logicalDigest + ".iso"
 			contentPresent := true
@@ -577,7 +576,7 @@ func TestProxmoxAPIClient_DeleteVM(t *testing.T) {
 			httpmock.RegisterResponder(http.MethodDelete, `=~/nodes/test/qemu/102`,
 				newJSONResponder(403, nil))
 			httpmock.RegisterResponder(http.MethodGet, `=~/nodes/test/qemu/101/config`,
-				newJSONResponder(200, proxmox.VirtualMachineConfig{CPU: "kvm64", IDE0: volID + ",media=cdrom,size=4M", Tags: cloudInitTag, TagsSlice: []string{cloudInitTag}}))
+				newJSONResponder(200, proxmox.VirtualMachineConfig{CPU: "kvm64"}))
 			httpmock.RegisterResponder(http.MethodGet, `=~/nodes/test/qemu/102/config`,
 				newJSONResponder(200, proxmox.VirtualMachineConfig{CPU: "kvm64"}))
 			httpmock.RegisterResponder(http.MethodGet, `=~/cluster/status`,
@@ -585,6 +584,8 @@ func TestProxmoxAPIClient_DeleteVM(t *testing.T) {
 					proxmox.NodeStatuses{{Name: "test"}, {Name: "test2"}}))
 			httpmock.RegisterResponder(http.MethodGet, `=~/nodes/test/storage/local/status`,
 				newJSONResponder(200, proxmox.Storage{Name: "local", Content: "iso", Enabled: 1}))
+			httpmock.RegisterResponder(http.MethodGet, `=~/nodes/test/storage$`,
+				httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": &proxmox.Storages{{Name: "local", Content: "iso", Enabled: 1}}}))
 			httpmock.RegisterResponder(http.MethodGet, `=~/nodes/test/storage/local/content`, func(*http.Request) (*http.Response, error) {
 				contents := []*proxmox.StorageContent{}
 				if contentPresent {
