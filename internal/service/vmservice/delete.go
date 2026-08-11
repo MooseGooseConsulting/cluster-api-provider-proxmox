@@ -18,7 +18,6 @@ package vmservice
 
 import (
 	"context"
-	"strings"
 
 	"github.com/pkg/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -36,8 +35,12 @@ func DeleteVM(ctx context.Context, machineScope *scope.MachineScope) error {
 	vmID := machineScope.ProxmoxMachine.GetVirtualMachineID()
 	node := machineScope.LocateProxmoxNode()
 
-	if _, err := machineScope.InfraCluster.ProxmoxClient.DeleteVM(ctx, node, vmID); err != nil {
-		if VMNotFound(err) || errors.Is(err, goproxmox.ErrVMIDFree) {
+	upload, err := cloudInitUploadState(machineScope)
+	if err != nil {
+		return err
+	}
+	if _, err := machineScope.InfraCluster.ProxmoxClient.DeleteVM(ctx, node, vmID, string(machineScope.ProxmoxMachine.UID), upload); err != nil {
+		if errors.Is(err, goproxmox.ErrVMIDFree) {
 			// remove machine from cluster status
 			machineScope.InfraCluster.ProxmoxCluster.RemoveNodeLocation(machineScope.Name(), util.IsControlPlaneMachine(machineScope.Machine))
 			// The VM is deleted so remove the finalizer.
@@ -53,9 +56,4 @@ func DeleteVM(ctx context.Context, machineScope *scope.MachineScope) error {
 	}
 
 	return nil
-}
-
-// VMNotFound checks if the given err is related to that the VM is not found in Proxmox.
-func VMNotFound(err error) bool {
-	return strings.Contains(err.Error(), "does not exist")
 }

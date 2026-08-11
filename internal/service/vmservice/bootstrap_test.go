@@ -30,6 +30,9 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/cluster-api/util/conditions"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	ipamicv1 "sigs.k8s.io/cluster-api-ipam-provider-in-cluster/api/v1alpha2"
 
@@ -39,6 +42,7 @@ import (
 	. "github.com/ionos-cloud/cluster-api-provider-proxmox/pkg/consts"
 	"github.com/ionos-cloud/cluster-api-provider-proxmox/pkg/ignition"
 	"github.com/ionos-cloud/cluster-api-provider-proxmox/pkg/network"
+	capmox "github.com/ionos-cloud/cluster-api-provider-proxmox/pkg/proxmox"
 	"github.com/ionos-cloud/cluster-api-provider-proxmox/pkg/scope"
 )
 
@@ -54,7 +58,7 @@ var defaultNic = infrav1.NetworkDevice{
 
 func setupFakeIsoInjector(t *testing.T) *[]byte {
 	networkData := new([]byte)
-	getISOInjector = func(vm *proxmox.VirtualMachine, bootstrapData []byte, metadata, network cloudinit.Renderer) isoInjector {
+	getISOInjector = func(_ capmox.Client, _ string, vm *proxmox.VirtualMachine, bootstrapData []byte, metadata, network cloudinit.Renderer, _ *capmox.CloudInitUpload, _ capmox.CloudInitUploadRecorder) isoInjector {
 		*networkData, _ = network.Inspect()
 		return FakeISOInjector{
 			VirtualMachine: vm,
@@ -269,7 +273,7 @@ func TestReconcileBootstrapData_BadInjector(t *testing.T) {
 	createIPPools(t, kubeClient, machineScope)
 	createIPAddress(t, kubeClient, machineScope, infrav1.DefaultNetworkDevice, "10.10.10.10", 0, &defaultPool)
 
-	getISOInjector = func(_ *proxmox.VirtualMachine, _ []byte, _, _ cloudinit.Renderer) isoInjector {
+	getISOInjector = func(_ capmox.Client, _ string, _ *proxmox.VirtualMachine, _ []byte, _, _ cloudinit.Renderer, _ *capmox.CloudInitUpload, _ capmox.CloudInitUploadRecorder) isoInjector {
 		return FakeISOInjector{Error: errors.New("bad FakeISOInjector")}
 	}
 	t.Cleanup(func() { getISOInjector = defaultISOInjector })
@@ -280,6 +284,103 @@ func TestReconcileBootstrapData_BadInjector(t *testing.T) {
 	require.False(t, requeue)
 	require.True(t, conditions.Has(machineScope.ProxmoxMachine, infrav1.ProxmoxMachineVirtualMachineProvisionedCondition))
 	require.Nil(t, machineScope.ProxmoxMachine.Status.BootstrapDataProvided)
+}
+
+func TestReconcileBootstrapData_RetriesStorageDiscoveryWithoutTerminalFailure(t *testing.T) {
+	machineScope, _, kubeClient := setupReconcilerTestWithCondition(t, infrav1.ProxmoxMachineVirtualMachineProvisionedWaitingForBootstrapDataReconciliationReason)
+	setupVMWithMetadata(machineScope)
+	createBootstrapSecret(t, kubeClient, machineScope, cloudinit.FormatCloudConfig)
+	defaultPool := addDefaultIPPool(machineScope)
+	createIPPools(t, kubeClient, machineScope)
+	createIPAddress(t, kubeClient, machineScope, infrav1.DefaultNetworkDevice, "10.10.10.10", 0, &defaultPool)
+	getISOInjector = func(_ capmox.Client, _ string, _ *proxmox.VirtualMachine, _ []byte, _, _ cloudinit.Renderer, _ *capmox.CloudInitUpload, _ capmox.CloudInitUploadRecorder) isoInjector {
+		return FakeISOInjector{Error: fmt.Errorf("%w: temporary storage inventory failure", capmox.ErrCloudInitStorageDiscoveryRetryable)}
+	}
+	t.Cleanup(func() { getISOInjector = defaultISOInjector })
+
+	requeue, err := reconcileBootstrapData(context.Background(), machineScope)
+	require.ErrorIs(t, err, capmox.ErrCloudInitStorageDiscoveryRetryable)
+	require.True(t, requeue)
+	require.Equal(t, infrav1.ProxmoxMachineVirtualMachineProvisionedWaitingForBootstrapDataReconciliationReason,
+		conditions.GetReason(machineScope.ProxmoxMachine, infrav1.ProxmoxMachineVirtualMachineProvisionedCondition))
+	require.Nil(t, machineScope.ProxmoxMachine.Status.BootstrapDataProvided)
+}
+
+func TestReconcileBootstrapData_RetriesPendingUploadWithoutTerminalFailure(t *testing.T) {
+	machineScope, _, kubeClient := setupReconcilerTestWithCondition(t, infrav1.ProxmoxMachineVirtualMachineProvisionedWaitingForBootstrapDataReconciliationReason)
+	setupVMWithMetadata(machineScope)
+	createBootstrapSecret(t, kubeClient, machineScope, cloudinit.FormatCloudConfig)
+	defaultPool := addDefaultIPPool(machineScope)
+	createIPPools(t, kubeClient, machineScope)
+	createIPAddress(t, kubeClient, machineScope, infrav1.DefaultNetworkDevice, "10.10.10.10", 0, &defaultPool)
+	getISOInjector = func(_ capmox.Client, _ string, _ *proxmox.VirtualMachine, _ []byte, _, _ cloudinit.Renderer, _ *capmox.CloudInitUpload, _ capmox.CloudInitUploadRecorder) isoInjector {
+		return FakeISOInjector{Error: fmt.Errorf("%w: accepted task remains active", capmox.ErrCloudInitUploadPending)}
+	}
+	t.Cleanup(func() { getISOInjector = defaultISOInjector })
+
+	requeue, err := reconcileBootstrapData(context.Background(), machineScope)
+	require.ErrorIs(t, err, capmox.ErrCloudInitUploadPending)
+	require.True(t, requeue)
+	require.Equal(t, infrav1.ProxmoxMachineVirtualMachineProvisionedWaitingForBootstrapDataReconciliationReason,
+		conditions.GetReason(machineScope.ProxmoxMachine, infrav1.ProxmoxMachineVirtualMachineProvisionedCondition))
+	require.Nil(t, machineScope.ProxmoxMachine.Status.BootstrapDataProvided)
+}
+
+func TestCloudInitUploadRecorderRestoresPriorAnnotationWhenPatchFails(t *testing.T) {
+	originalScope, _, kubeClient := setupReconcilerTest(t)
+	originalScope.ProxmoxMachine.Annotations = map[string]string{"stable": "kept"}
+	patchCalls := 0
+	failPatch := true
+	patchErr := errors.New("transient patch failure")
+	failingClient := fake.NewClientBuilder().
+		WithScheme(kubeClient.Scheme()).
+		WithObjects(originalScope.ProxmoxMachine.DeepCopy()).
+		WithStatusSubresource(&infrav1.ProxmoxMachine{}).
+		WithInterceptorFuncs(interceptor.Funcs{Patch: func(ctx context.Context, inner client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+			patchCalls++
+			if failPatch {
+				return patchErr
+			}
+			return inner.Patch(ctx, obj, patch, opts...)
+		}}).
+		Build()
+	machineScope, err := scope.NewMachineScope(scope.MachineScopeParams{
+		Client:         failingClient,
+		Logger:         originalScope.Logger,
+		Cluster:        originalScope.Cluster,
+		Machine:        originalScope.Machine,
+		InfraCluster:   originalScope.InfraCluster,
+		ProxmoxMachine: originalScope.ProxmoxMachine,
+		IPAMHelper:     originalScope.IPAMHelper,
+	})
+	require.NoError(t, err)
+	upload := capmox.CloudInitUpload{Version: 1, Node: "pve", Storage: "local", VolID: "local:iso/owned.iso", Size: 4096, Phase: capmox.CloudInitUploadPhaseIntent}
+
+	err = cloudInitUploadRecorder(machineScope)(upload)
+	require.ErrorIs(t, err, patchErr)
+	require.Equal(t, map[string]string{"stable": "kept"}, machineScope.ProxmoxMachine.Annotations,
+		"failed durable write must not leave a false intent for deferred Close")
+	failPatch = false
+	require.NoError(t, machineScope.Close())
+	stored := &infrav1.ProxmoxMachine{}
+	require.NoError(t, failingClient.Get(context.Background(), client.ObjectKeyFromObject(machineScope.ProxmoxMachine), stored))
+	require.Equal(t, "kept", stored.Annotations["stable"])
+	require.NotContains(t, stored.Annotations, cloudInitUploadAnnotation)
+
+	upload.Phase = capmox.CloudInitUploadPhaseComplete
+	require.NoError(t, cloudInitUploadRecorder(machineScope)(upload))
+	failPatch = true
+	err = clearCompletedCloudInitUploadState(machineScope)
+	require.ErrorIs(t, err, patchErr)
+	state, stateErr := cloudInitUploadState(machineScope)
+	require.NoError(t, stateErr)
+	require.Equal(t, capmox.CloudInitUploadPhaseComplete, state.Phase,
+		"failed durable clear must restore the completed record for retry")
+	failPatch = false
+	require.NoError(t, machineScope.Close())
+	require.NoError(t, failingClient.Get(context.Background(), client.ObjectKeyFromObject(machineScope.ProxmoxMachine), stored))
+	require.Contains(t, stored.Annotations, cloudInitUploadAnnotation)
+	require.Equal(t, 3, patchCalls, "only the intent, complete, and clear boundaries require API patches")
 }
 
 func TestGetBootstrapData_MissingSecretName(t *testing.T) {
@@ -731,7 +832,7 @@ func TestReconcileBootstrapData_Format_Ignition(t *testing.T) {
 
 	createIPAddress(t, kubeClient, machineScope, infrav1.DefaultNetworkDevice, "10.10.10.10", 0)
 
-	getIgnitionISOInjector = func(_ *proxmox.VirtualMachine, _ cloudinit.Renderer, _ *ignition.Enricher) isoInjector {
+	getIgnitionISOInjector = func(_ capmox.Client, _ string, _ *proxmox.VirtualMachine, _ cloudinit.Renderer, _ *ignition.Enricher, _ *capmox.CloudInitUpload, _ capmox.CloudInitUploadRecorder) isoInjector {
 		return FakeIgnitionISOInjector{}
 	}
 	t.Cleanup(func() { getISOInjector = defaultISOInjector })
@@ -748,17 +849,17 @@ func TestReconcileBootstrapData_Format_Ignition(t *testing.T) {
 }
 
 func TestDefaultISOInjector(t *testing.T) {
-	injector := defaultISOInjector(newRunningVM(), []byte("data"), cloudinit.NewMetadata(biosUUID, "test", "1.2.3", true), cloudinit.NewNetworkConfig(nil))
+	injector := defaultISOInjector(nil, "test-machine-uid", newRunningVM(), []byte("data"), cloudinit.NewMetadata(biosUUID, "test", "1.2.3", true), cloudinit.NewNetworkConfig(nil), nil, nil)
 
 	require.NotEmpty(t, injector)
 	require.Equal(t, []byte("data"), injector.(*inject.ISOInjector).BootstrapData)
 }
 
 func TestIgnitionISOInjector(t *testing.T) {
-	injector := defaultIgnitionISOInjector(newRunningVM(), cloudinit.NewMetadata(biosUUID, "test", "1.2.3", true), &ignition.Enricher{
+	injector := defaultIgnitionISOInjector(nil, "test-machine-uid", newRunningVM(), cloudinit.NewMetadata(biosUUID, "test", "1.2.3", true), &ignition.Enricher{
 		BootstrapData: []byte("data"),
 		Hostname:      "test",
-	})
+	}, nil, nil)
 
 	require.NotEmpty(t, injector)
 	require.NotNil(t, injector.(*inject.ISOInjector).IgnitionEnricher)

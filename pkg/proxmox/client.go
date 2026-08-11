@@ -19,8 +19,46 @@ package proxmox
 
 import (
 	"context"
+	"errors"
 
 	"github.com/luthermonson/go-proxmox"
+)
+
+// ErrCloudInitStorageDiscoveryRetryable marks storage inventory/capacity state
+// that must be retried without terminalizing Machine provisioning.
+var ErrCloudInitStorageDiscoveryRetryable = errors.New("cloud-init storage discovery is retryable")
+
+// ErrCloudInitUploadPending marks a durable upload whose exact task or artifact
+// is not yet terminally observable. Reconciliation must not dispatch again.
+var ErrCloudInitUploadPending = errors.New("cloud-init upload is pending")
+
+// CloudInitUpload records the durable identity and progress of one immutable
+// cloud-init upload. Callers persist each update before CloudInit continues.
+type CloudInitUpload struct {
+	Version        int    `json:"version"`
+	Node           string `json:"node"`
+	Storage        string `json:"storage"`
+	VolID          string `json:"volID"`
+	Size           uint64 `json:"size"`
+	Attempt        uint64 `json:"attempt,omitempty"`
+	DispatchOwner  string `json:"dispatchOwner,omitempty"`
+	LeaseUntilUnix int64  `json:"leaseUntilUnix,omitempty"`
+	UPID           string `json:"upid,omitempty"`
+	Phase          string `json:"phase"`
+}
+
+// CloudInitUploadRecorder durably records an upload boundary.
+type CloudInitUploadRecorder func(CloudInitUpload) error
+
+const (
+	// CloudInitUploadPhaseIntent means the exact target was durably recorded before dispatch.
+	CloudInitUploadPhaseIntent = "intent"
+	// CloudInitUploadPhaseDispatching means the durable owner was revalidated immediately before POST.
+	CloudInitUploadPhaseDispatching = "dispatching"
+	// CloudInitUploadPhaseAccepted means PVE returned a task UPID that was durably recorded.
+	CloudInitUploadPhaseAccepted = "accepted"
+	// CloudInitUploadPhaseComplete means the exact artifact was proven after task completion.
+	CloudInitUploadPhaseComplete = "complete"
 )
 
 // Client Global Proxmox client interface.
@@ -28,6 +66,7 @@ type Client interface {
 	CloneVM(ctx context.Context, templateID int, clone VMCloneRequest) (VMCloneResponse, error)
 
 	ConfigureVM(ctx context.Context, vm *proxmox.VirtualMachine, options ...VirtualMachineOption) (*proxmox.Task, error)
+	CloudInit(ctx context.Context, vm *proxmox.VirtualMachine, machineIdentity, device, userdata, metadata, vendordata, networkconfig string, current *CloudInitUpload, recorder CloudInitUploadRecorder) error
 
 	FindVMResource(ctx context.Context, vmID uint64) (*proxmox.ClusterResource, error)
 	FindVMTemplateByTags(ctx context.Context, templateTags []string, resolutionPolicy string) (string, int32, error)
@@ -36,7 +75,7 @@ type Client interface {
 
 	GetVM(ctx context.Context, nodeName string, vmID int64) (*proxmox.VirtualMachine, error)
 
-	DeleteVM(ctx context.Context, nodeName string, vmID int64) (*proxmox.Task, error)
+	DeleteVM(ctx context.Context, nodeName string, vmID int64, machineIdentity string, upload *CloudInitUpload) (*proxmox.Task, error)
 
 	GetTask(ctx context.Context, upID string) (*proxmox.Task, error)
 
@@ -50,7 +89,7 @@ type Client interface {
 
 	TagVM(ctx context.Context, vm *proxmox.VirtualMachine, tag string) (*proxmox.Task, error)
 
-	UnmountCloudInitISO(ctx context.Context, vm *proxmox.VirtualMachine, device string) error
+	UnmountCloudInitISO(ctx context.Context, vm *proxmox.VirtualMachine, machineIdentity, device string) error
 
 	CloudInitStatus(ctx context.Context, vm *proxmox.VirtualMachine) (bool, error)
 

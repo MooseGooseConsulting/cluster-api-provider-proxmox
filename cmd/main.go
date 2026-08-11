@@ -231,8 +231,7 @@ func setupProxmoxClient(ctx context.Context, logger logr.Logger) (capmox.Client,
 	}
 
 	httpClient := &http.Client{Transport: tr}
-	return goproxmox.NewAPIClient(ctx, logger, ProxmoxURL,
-		proxmox.WithHTTPClient(httpClient),
+	return goproxmox.NewAPIClient(ctx, logger, ProxmoxURL, httpClient,
 		proxmox.WithAPIToken(ProxmoxTokenID, ProxmoxSecret),
 	)
 }

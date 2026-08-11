@@ -39,6 +39,7 @@ import (
 	"github.com/ionos-cloud/cluster-api-provider-proxmox/pkg/cloudinit"
 	"github.com/ionos-cloud/cluster-api-provider-proxmox/pkg/ignition"
 	"github.com/ionos-cloud/cluster-api-provider-proxmox/pkg/network"
+	capmox "github.com/ionos-cloud/cluster-api-provider-proxmox/pkg/proxmox"
 	"github.com/ionos-cloud/cluster-api-provider-proxmox/pkg/scope"
 )
 
@@ -93,6 +94,10 @@ func reconcileBootstrapData(ctx context.Context, machineScope *scope.MachineScop
 		err = injectCloudInit(ctx, machineScope, bootstrapData, biosUUID, nicData, kubernetesVersion)
 	}
 	if err != nil {
+		if errors.Is(err, capmox.ErrCloudInitStorageDiscoveryRetryable) || errors.Is(err, capmox.ErrCloudInitUploadPending) {
+			machineScope.Logger.V(2).Info("cloud-init reconciliation will be retried", "error", err.Error())
+			return true, errors.Wrap(err, "retry cloud-init reconciliation")
+		}
 		// Todo: test this (colliding default gateways for example)
 		conditions.Set(machineScope.ProxmoxMachine, metav1.Condition{
 			Type:    infrav1.ProxmoxMachineVirtualMachineProvisionedCondition,
@@ -122,7 +127,11 @@ func injectCloudInit(ctx context.Context, machineScope *scope.MachineScope, boot
 	// create metadata renderer
 	metadata := cloudinit.NewMetadata(biosUUID, machineScope.Name(), kubernetesVersion, *ptr.Deref(machineScope.ProxmoxMachine.Spec.MetadataSettings, infrav1.MetadataSettings{ProviderIDInjection: new(false)}).ProviderIDInjection)
 
-	injector := getISOInjector(machineScope.VirtualMachine, bootstrapData, metadata, network)
+	upload, err := cloudInitUploadState(machineScope)
+	if err != nil {
+		return err
+	}
+	injector := getISOInjector(machineScope.InfraCluster.ProxmoxClient, string(machineScope.ProxmoxMachine.UID), machineScope.VirtualMachine, bootstrapData, metadata, network, upload, cloudInitUploadRecorder(machineScope))
 	return injector.Inject(ctx, inject.CloudConfigFormat)
 }
 
@@ -139,7 +148,11 @@ func injectIgnition(ctx context.Context, machineScope *scope.MachineScope, boots
 		Network:       nicData,
 	}
 
-	injector := getIgnitionISOInjector(machineScope.VirtualMachine, metadata, enricher)
+	upload, err := cloudInitUploadState(machineScope)
+	if err != nil {
+		return err
+	}
+	injector := getIgnitionISOInjector(machineScope.InfraCluster.ProxmoxClient, string(machineScope.ProxmoxMachine.UID), machineScope.VirtualMachine, metadata, enricher, upload, cloudInitUploadRecorder(machineScope))
 	return injector.Inject(ctx, inject.IgnitionFormat)
 }
 
@@ -147,18 +160,26 @@ type isoInjector interface {
 	Inject(ctx context.Context, format inject.BootstrapDataFormat) error
 }
 
-func defaultISOInjector(vm *proxmox.VirtualMachine, bootStrapData []byte, metadata, network cloudinit.Renderer) isoInjector {
+func defaultISOInjector(client capmox.Client, machineIdentity string, vm *proxmox.VirtualMachine, bootStrapData []byte, metadata, network cloudinit.Renderer, upload *capmox.CloudInitUpload, recorder capmox.CloudInitUploadRecorder) isoInjector {
 	return &inject.ISOInjector{
 		VirtualMachine:  vm,
+		ProxmoxClient:   client,
+		MachineIdentity: machineIdentity,
+		UploadState:     upload,
+		UploadRecorder:  recorder,
 		BootstrapData:   bootStrapData,
 		MetaRenderer:    metadata,
 		NetworkRenderer: network,
 	}
 }
 
-func defaultIgnitionISOInjector(vm *proxmox.VirtualMachine, metadata cloudinit.Renderer, enricher *ignition.Enricher) isoInjector {
+func defaultIgnitionISOInjector(client capmox.Client, machineIdentity string, vm *proxmox.VirtualMachine, metadata cloudinit.Renderer, enricher *ignition.Enricher, upload *capmox.CloudInitUpload, recorder capmox.CloudInitUploadRecorder) isoInjector {
 	return &inject.ISOInjector{
 		VirtualMachine:   vm,
+		ProxmoxClient:    client,
+		MachineIdentity:  machineIdentity,
+		UploadState:      upload,
+		UploadRecorder:   recorder,
 		IgnitionEnricher: enricher,
 		MetaRenderer:     metadata,
 	}
@@ -168,6 +189,66 @@ var (
 	getISOInjector         = defaultISOInjector
 	getIgnitionISOInjector = defaultIgnitionISOInjector
 )
+
+const cloudInitUploadAnnotation = "infrastructure.cluster.x-k8s.io/cloud-init-upload"
+
+func cloudInitUploadRecorder(machineScope *scope.MachineScope) capmox.CloudInitUploadRecorder {
+	return func(upload capmox.CloudInitUpload) error {
+		return persistCloudInitUploadState(machineScope, &upload)
+	}
+}
+
+func persistCloudInitUploadState(machineScope *scope.MachineScope, upload *capmox.CloudInitUpload) error {
+	previous := maps.Clone(machineScope.ProxmoxMachine.GetAnnotations())
+	annotations := maps.Clone(previous)
+	if annotations == nil {
+		annotations = map[string]string{}
+	}
+	if upload == nil {
+		if _, exists := annotations[cloudInitUploadAnnotation]; !exists {
+			return nil
+		}
+		delete(annotations, cloudInitUploadAnnotation)
+	} else {
+		encoded, err := json.Marshal(upload)
+		if err != nil {
+			return errors.Wrap(err, "encode cloud-init upload state")
+		}
+		if annotations[cloudInitUploadAnnotation] == string(encoded) {
+			return nil
+		}
+		annotations[cloudInitUploadAnnotation] = string(encoded)
+	}
+	machineScope.ProxmoxMachine.SetAnnotations(annotations)
+	if err := machineScope.PatchObject(); err != nil {
+		machineScope.ProxmoxMachine.SetAnnotations(previous)
+		return errors.Wrap(err, "persist cloud-init upload state")
+	}
+	return nil
+}
+
+func clearCompletedCloudInitUploadState(machineScope *scope.MachineScope) error {
+	upload, err := cloudInitUploadState(machineScope)
+	if err != nil || upload == nil {
+		return err
+	}
+	if upload.Phase != capmox.CloudInitUploadPhaseComplete {
+		return fmt.Errorf("refusing to clear non-complete cloud-init upload phase %q", upload.Phase)
+	}
+	return persistCloudInitUploadState(machineScope, nil)
+}
+
+func cloudInitUploadState(machineScope *scope.MachineScope) (*capmox.CloudInitUpload, error) {
+	raw := machineScope.ProxmoxMachine.GetAnnotations()[cloudInitUploadAnnotation]
+	if raw == "" {
+		return nil, nil
+	}
+	var upload capmox.CloudInitUpload
+	if err := json.Unmarshal([]byte(raw), &upload); err != nil {
+		return nil, errors.Wrap(err, "decode cloud-init upload state")
+	}
+	return &upload, nil
+}
 
 // getBootstrapData obtains a machine's bootstrap data from the relevant K8s secret and returns the data.
 // TODO: Add format return if ignition will be supported.

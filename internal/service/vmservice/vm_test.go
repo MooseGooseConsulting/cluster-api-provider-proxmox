@@ -18,6 +18,7 @@ package vmservice
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 
@@ -27,6 +28,7 @@ import (
 	"k8s.io/utils/ptr"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	"sigs.k8s.io/cluster-api/util/conditions"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	infrav1 "github.com/ionos-cloud/cluster-api-provider-proxmox/api/v1alpha2"
 	"github.com/ionos-cloud/cluster-api-provider-proxmox/internal/service/scheduler"
@@ -682,9 +684,37 @@ func TestReconcileDisks_UnmountCloudInitISO(t *testing.T) {
 	vm.VirtualMachineConfig.IDE0 = "local:iso/cloud-init.iso,media=cdrom"
 	machineScope.SetVirtualMachine(vm)
 
-	proxmoxClient.EXPECT().UnmountCloudInitISO(context.Background(), vm, "ide0").Return(nil)
+	proxmoxClient.EXPECT().UnmountCloudInitISO(context.Background(), vm, string(machineScope.ProxmoxMachine.UID), "ide0").Return(nil)
 
 	require.NoError(t, unmountCloudInitISO(context.Background(), machineScope))
+}
+
+func TestUnmountCloudInitISOClearsCompletedUploadOnlyAfterCleanup(t *testing.T) {
+	machineScope, proxmoxClient, kubeClient := setupReconcilerTestWithCondition(t, infrav1.ProxmoxMachineVirtualMachineProvisionedWaitingForBootstrapReadyReason)
+	upload := proxmox.CloudInitUpload{
+		Version: 1, Node: "node1", Storage: "local", VolID: "local:iso/owned.iso", Size: 4096,
+		Phase: proxmox.CloudInitUploadPhaseComplete,
+	}
+	require.NoError(t, cloudInitUploadRecorder(machineScope)(upload))
+	vm := newRunningVM()
+	machineScope.SetVirtualMachine(vm)
+	cleanupErr := errors.New("cleanup failed")
+	proxmoxClient.EXPECT().UnmountCloudInitISO(context.Background(), vm, string(machineScope.ProxmoxMachine.UID), "ide0").Return(cleanupErr).Once()
+
+	err := unmountCloudInitISO(context.Background(), machineScope)
+	require.ErrorIs(t, err, cleanupErr)
+	state, stateErr := cloudInitUploadState(machineScope)
+	require.NoError(t, stateErr)
+	require.NotNil(t, state, "failed cleanup must retain durable ownership state")
+
+	proxmoxClient.EXPECT().UnmountCloudInitISO(context.Background(), vm, string(machineScope.ProxmoxMachine.UID), "ide0").Return(nil).Once()
+	require.NoError(t, unmountCloudInitISO(context.Background(), machineScope))
+	state, stateErr = cloudInitUploadState(machineScope)
+	require.NoError(t, stateErr)
+	require.Nil(t, state)
+	stored := &infrav1.ProxmoxMachine{}
+	require.NoError(t, kubeClient.Get(context.Background(), client.ObjectKeyFromObject(machineScope.ProxmoxMachine), stored))
+	require.NotContains(t, stored.Annotations, cloudInitUploadAnnotation)
 }
 
 func TestReconcileVM_CloudInitFailed(t *testing.T) {
@@ -909,7 +939,7 @@ func TestReconcileVM_StateMachine(t *testing.T) {
 	machineScope.Machine.Status.NodeRef = clusterv1.MachineNodeReference{Name: "node2"}
 
 	proxmoxClient.EXPECT().GetVM(context.Background(), "node2", int64(123)).Return(vm, nil).Once()
-	proxmoxClient.EXPECT().UnmountCloudInitISO(context.Background(), vm, "ide0").Return(nil).Once()
+	proxmoxClient.EXPECT().UnmountCloudInitISO(context.Background(), vm, string(machineScope.ProxmoxMachine.UID), "ide0").Return(nil).Once()
 
 	result, err = ReconcileVM(context.Background(), machineScope)
 	require.NoError(t, err)

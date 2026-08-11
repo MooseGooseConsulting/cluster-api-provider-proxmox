@@ -25,6 +25,7 @@ import (
 
 	"github.com/ionos-cloud/cluster-api-provider-proxmox/pkg/cloudinit"
 	"github.com/ionos-cloud/cluster-api-provider-proxmox/pkg/ignition"
+	capmox "github.com/ionos-cloud/cluster-api-provider-proxmox/pkg/proxmox"
 
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
@@ -35,6 +36,12 @@ const CloudInitISODevice = "ide0"
 // ISOInjector used to Inject cloudinit userdata, metadata and network-config into a Proxmox VirtualMachine.
 type ISOInjector struct {
 	VirtualMachine *proxmox.VirtualMachine
+	ProxmoxClient  interface {
+		CloudInit(ctx context.Context, vm *proxmox.VirtualMachine, machineIdentity, device, userdata, metadata, vendordata, networkconfig string, current *capmox.CloudInitUpload, recorder capmox.CloudInitUploadRecorder) error
+	}
+	MachineIdentity string
+	UploadState     *capmox.CloudInitUpload
+	UploadRecorder  capmox.CloudInitUploadRecorder
 
 	BootstrapData []byte
 
@@ -58,6 +65,9 @@ func (i *ISOInjector) Inject(ctx context.Context, format BootstrapDataFormat) er
 
 func (i *ISOInjector) injectCloudInit(ctx context.Context) error {
 	logger := log.FromContext(ctx)
+	if i.ProxmoxClient == nil {
+		return errors.New("proxmox client is not defined")
+	}
 
 	// Render metadata.
 	metadata, err := i.MetaRenderer.Render()
@@ -74,7 +84,7 @@ func (i *ISOInjector) injectCloudInit(ctx context.Context) error {
 	logger.V(4).Info("CloudInit:", "network-config", string(network))
 
 	// Inject an ISO with userdata, metadata and network-config into the VirtualMachine.
-	err = i.VirtualMachine.CloudInit(ctx, CloudInitISODevice, string(i.BootstrapData), string(metadata), "", string(network))
+	err = i.ProxmoxClient.CloudInit(ctx, i.VirtualMachine, i.MachineIdentity, CloudInitISODevice, string(i.BootstrapData), string(metadata), "", string(network), i.UploadState, i.UploadRecorder)
 	if err != nil {
 		return errors.Wrap(err, "unable to inject CloudInit ISO")
 	}
@@ -84,6 +94,9 @@ func (i *ISOInjector) injectCloudInit(ctx context.Context) error {
 
 func (i *ISOInjector) injectIgnition(ctx context.Context) error {
 	logger := log.FromContext(ctx)
+	if i.ProxmoxClient == nil {
+		return errors.New("proxmox client is not defined")
+	}
 
 	if i.IgnitionEnricher == nil {
 		return errors.New("ignition enricher is not defined")
@@ -111,7 +124,7 @@ func (i *ISOInjector) injectIgnition(ctx context.Context) error {
 	logger.V(4).Info("Ingnition", "bootstrapData", bootstrapData)
 
 	// Inject an ISO with ignition userdata, metadata and an empty network-config v1 into the VirtualMachine.
-	err = i.VirtualMachine.CloudInit(ctx, CloudInitISODevice, string(bootstrapData), string(metadata), "", string(cloudinit.EmptyNetworkV1))
+	err = i.ProxmoxClient.CloudInit(ctx, i.VirtualMachine, i.MachineIdentity, CloudInitISODevice, string(bootstrapData), string(metadata), "", string(cloudinit.EmptyNetworkV1), i.UploadState, i.UploadRecorder)
 	if err != nil {
 		return errors.Wrap(err, "unable to inject ignition userdata iso")
 	}

@@ -18,7 +18,9 @@ package inject
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/netip"
 	"testing"
@@ -31,6 +33,7 @@ import (
 	"github.com/ionos-cloud/cluster-api-provider-proxmox/pkg/cloudinit"
 	"github.com/ionos-cloud/cluster-api-provider-proxmox/pkg/ignition"
 	"github.com/ionos-cloud/cluster-api-provider-proxmox/pkg/network"
+	capmox "github.com/ionos-cloud/cluster-api-provider-proxmox/pkg/proxmox"
 	"github.com/ionos-cloud/cluster-api-provider-proxmox/pkg/proxmox/goproxmox"
 )
 
@@ -106,10 +109,17 @@ func TestISOInjectorInjectCloudInit(t *testing.T) {
 	vm, err := client.GetVM(context.Background(), "pve", 100)
 	require.NoError(t, err)
 
+	var uploadStates []capmox.CloudInitUpload
 	injector := &ISOInjector{
-		VirtualMachine: vm,
-		BootstrapData:  []byte(""),
-		MetaRenderer:   cloudinit.NewMetadata("xxx-xxxx", "my-custom-vm", "1.2.3", true),
+		VirtualMachine:  vm,
+		ProxmoxClient:   client,
+		MachineIdentity: "test-machine-uid",
+		UploadRecorder: func(upload capmox.CloudInitUpload) error {
+			uploadStates = append(uploadStates, upload)
+			return nil
+		},
+		BootstrapData: []byte(""),
+		MetaRenderer:  cloudinit.NewMetadata("xxx-xxxx", "my-custom-vm", "1.2.3", true),
 		NetworkRenderer: cloudinit.NewNetworkConfig([]network.ConfigData{
 			{
 				Type:       "ethernet",
@@ -122,8 +132,8 @@ func TestISOInjectorInjectCloudInit(t *testing.T) {
 		}),
 	}
 
-	httpmock.RegisterResponder(http.MethodGet, fmt.Sprintf(`=~/nodes/%s/storage`, "pve"),
-		newJSONResponder(200, &proxmox.Storages{{Name: "iso", Content: "iso", Enabled: 1}}, 1))
+	httpmock.RegisterResponder(http.MethodGet, fmt.Sprintf(`=~/nodes/%s/storage$`, "pve"),
+		newJSONResponder(200, &proxmox.Storages{{Name: "iso", Content: "iso", Enabled: 1, Avail: 1 << 30}}, 1))
 
 	ptask := &proxmox.Task{
 		UPID:      "UPID:pve:003B4235:1DF4ABCA:667C1C45:vncproxy:103:root@pam:",
@@ -133,18 +143,28 @@ func TestISOInjectorInjectCloudInit(t *testing.T) {
 		Node:      "pve",
 		IsRunning: false,
 	}
+	var uploadedName string
+	var uploadedSize uint64
+	httpmock.RegisterResponder(http.MethodGet, fmt.Sprintf(`=~/nodes/%s/storage/iso/content`, "pve"),
+		storageContentsResponder(&uploadedName, &uploadedSize))
 
 	httpmock.RegisterResponder(http.MethodPost, fmt.Sprintf(`=~/nodes/%s/storage/iso/upload`, "pve"),
-		newJSONResponder(200, ptask.UPID, 1))
+		captureUploadResponder(t, &uploadedName, &uploadedSize, ptask.UPID))
 
 	httpmock.RegisterResponder(http.MethodGet, fmt.Sprintf(`=~/nodes/%s/tasks/%s/status`, "pve", string(ptask.UPID)),
-		newJSONResponder(200, ptask, 4))
+		newJSONResponder(200, ptask, 6))
 
 	httpmock.RegisterResponder(http.MethodPost, fmt.Sprintf(`=~/nodes/%s/qemu/%d/config`, "pve", 100),
 		newJSONResponder(200, ptask.UPID, 2))
 
 	err = injector.Inject(context.Background(), "cloud-config")
 	require.NoError(t, err)
+	require.Len(t, uploadStates, 4)
+	require.Equal(t, capmox.CloudInitUploadPhaseIntent, uploadStates[0].Phase)
+	require.Equal(t, capmox.CloudInitUploadPhaseDispatching, uploadStates[1].Phase)
+	require.Equal(t, capmox.CloudInitUploadPhaseAccepted, uploadStates[2].Phase)
+	require.Equal(t, string(ptask.UPID), uploadStates[2].UPID)
+	require.Equal(t, capmox.CloudInitUploadPhaseComplete, uploadStates[3].Phase)
 }
 
 func TestISOInjectorInjectCloudInit_Errors(t *testing.T) {
@@ -180,6 +200,13 @@ func TestISOInjectorInjectCloudInit_Errors(t *testing.T) {
 	injector.NetworkRenderer = cloudinit.NewNetworkConfig(nil)
 	err = injector.Inject(context.Background(), "cloudinit")
 	require.Error(t, err)
+
+	// missing Proxmox client
+	injector.NetworkRenderer = cloudinit.NewNetworkConfig([]network.ConfigData{{
+		Type: "ethernet", Name: "eth0", MacAddress: "aa:bb:cc:dd:ee:ff",
+	}})
+	err = injector.Inject(context.Background(), CloudConfigFormat)
+	require.ErrorContains(t, err, "proxmox client is not defined")
 }
 
 func TestISOInjectorInjectIgnition(t *testing.T) {
@@ -227,13 +254,16 @@ func TestISOInjectorInjectIgnition(t *testing.T) {
 
 	injector := &ISOInjector{
 		VirtualMachine:   vm,
+		ProxmoxClient:    client,
+		MachineIdentity:  "test-machine-uid",
+		UploadRecorder:   func(capmox.CloudInitUpload) error { return nil },
 		BootstrapData:    []byte(bootstrapData),
 		MetaRenderer:     cloudinit.NewMetadata("xxx-xxxx", "my-custom-vm", "1.2.3", false),
 		IgnitionEnricher: enricher,
 	}
 
-	httpmock.RegisterResponder(http.MethodGet, fmt.Sprintf(`=~/nodes/%s/storage`, "pve"),
-		newJSONResponder(200, &proxmox.Storages{{Name: "iso", Content: "iso", Enabled: 1}}, 1))
+	httpmock.RegisterResponder(http.MethodGet, fmt.Sprintf(`=~/nodes/%s/storage$`, "pve"),
+		newJSONResponder(200, &proxmox.Storages{{Name: "iso", Content: "iso", Enabled: 1, Avail: 1 << 30}}, 1))
 
 	ptask := &proxmox.Task{
 		UPID:      "UPID:pve:003B4235:1DF4ABCA:667C1C45:vncproxy:103:root@pam:",
@@ -243,18 +273,54 @@ func TestISOInjectorInjectIgnition(t *testing.T) {
 		Node:      "pve",
 		IsRunning: false,
 	}
+	var uploadedName string
+	var uploadedSize uint64
+	httpmock.RegisterResponder(http.MethodGet, fmt.Sprintf(`=~/nodes/%s/storage/iso/content`, "pve"),
+		storageContentsResponder(&uploadedName, &uploadedSize))
 
 	httpmock.RegisterResponder(http.MethodPost, fmt.Sprintf(`=~/nodes/%s/storage/iso/upload`, "pve"),
-		newJSONResponder(200, ptask.UPID, 1))
+		captureUploadResponder(t, &uploadedName, &uploadedSize, ptask.UPID))
 
 	httpmock.RegisterResponder(http.MethodGet, fmt.Sprintf(`=~/nodes/%s/tasks/%s/status`, "pve", string(ptask.UPID)),
-		newJSONResponder(200, ptask, 4))
+		newJSONResponder(200, ptask, 6))
 
 	httpmock.RegisterResponder(http.MethodPost, fmt.Sprintf(`=~/nodes/%s/qemu/%d/config`, "pve", 100),
 		newJSONResponder(200, ptask.UPID, 2))
 
 	err = injector.Inject(context.Background(), "ignition")
 	require.NoError(t, err)
+}
+
+func captureUploadResponder(t *testing.T, uploadedName *string, uploadedSize *uint64, upid proxmox.UPID) httpmock.Responder {
+	t.Helper()
+	return func(request *http.Request) (*http.Response, error) {
+		reader, err := request.MultipartReader()
+		require.NoError(t, err)
+		for {
+			part, partErr := reader.NextPart()
+			if errors.Is(partErr, io.EOF) {
+				break
+			}
+			require.NoError(t, partErr)
+			contents, readErr := io.ReadAll(part)
+			require.NoError(t, readErr)
+			if part.FormName() == "filename" {
+				*uploadedName = part.FileName()
+				*uploadedSize = uint64(len(contents))
+			}
+		}
+		return httpmock.NewJsonResponse(200, map[string]any{"data": upid})
+	}
+}
+
+func storageContentsResponder(uploadedName *string, uploadedSize *uint64) httpmock.Responder {
+	return func(*http.Request) (*http.Response, error) {
+		contents := []*proxmox.StorageContent{}
+		if *uploadedName != "" {
+			contents = append(contents, &proxmox.StorageContent{Volid: "iso:iso/" + *uploadedName, Format: "iso", Size: *uploadedSize})
+		}
+		return httpmock.NewJsonResponse(200, map[string]any{"data": contents})
+	}
 }
 
 func TestISOInjectorInjectIgnition_Errors(t *testing.T) {
@@ -351,7 +417,7 @@ func newTestClient(t *testing.T) *goproxmox.APIClient {
 	httpmock.RegisterResponder(http.MethodGet, baseURLWithTrailingSlash+"api2/json/version",
 		newJSONResponder(200, proxmox.Version{Release: "test"}, 1))
 
-	client, err := goproxmox.NewAPIClient(context.Background(), logr.Discard(), baseURLWithTrailingSlash)
+	client, err := goproxmox.NewAPIClient(context.Background(), logr.Discard(), baseURLWithTrailingSlash, http.DefaultClient)
 	require.NoError(t, err)
 
 	return client

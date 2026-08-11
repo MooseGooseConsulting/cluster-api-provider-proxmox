@@ -21,9 +21,11 @@ import (
 	"context"
 	"fmt"
 	"maps"
+	"net/http"
 	"net/url"
 	"slices"
 	"strings"
+	"sync"
 
 	"github.com/go-logr/logr"
 	"github.com/luthermonson/go-proxmox"
@@ -42,17 +44,61 @@ var ErrVMIDFree = errors.New("VMID is free")
 // APIClient Proxmox API client object.
 type APIClient struct {
 	*proxmox.Client
-	logger logr.Logger
+	logger          logr.Logger
+	uploadTransport *uploadContextTransport
+}
+
+type uploadContextTransport struct {
+	base    http.RoundTripper
+	serial  sync.Mutex
+	mu      sync.RWMutex
+	context context.Context
+}
+
+func (t *uploadContextTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	if strings.HasSuffix(request.URL.Path, "/upload") {
+		t.mu.RLock()
+		ctx := t.context
+		t.mu.RUnlock()
+		if ctx != nil {
+			request = request.Clone(ctx)
+		}
+	}
+	return t.base.RoundTrip(request)
+}
+
+func (t *uploadContextTransport) withContext(ctx context.Context, dispatch func() (*proxmox.Task, error)) (*proxmox.Task, error) {
+	t.serial.Lock()
+	defer t.serial.Unlock()
+	t.mu.Lock()
+	t.context = ctx
+	t.mu.Unlock()
+	defer func() {
+		t.mu.Lock()
+		t.context = nil
+		t.mu.Unlock()
+	}()
+	return dispatch()
 }
 
 // NewAPIClient initializes a Proxmox API client. If the client is misconfigured, an error is returned.
-func NewAPIClient(ctx context.Context, logger logr.Logger, baseURL string, options ...proxmox.Option) (*APIClient, error) {
+func NewAPIClient(ctx context.Context, logger logr.Logger, baseURL string, httpClient *http.Client, options ...proxmox.Option) (*APIClient, error) {
 	proxmoxAPIURL, err := url.JoinPath(baseURL, "api2", "json")
 	if err != nil {
 		return nil, fmt.Errorf("invalid proxmox base URL %q: %w", baseURL, err)
 	}
 
-	options = append(options, proxmox.WithLogger(capmox.Logger{}))
+	if httpClient == nil {
+		httpClient = http.DefaultClient
+	}
+	baseTransport := httpClient.Transport
+	if baseTransport == nil {
+		baseTransport = http.DefaultTransport
+	}
+	uploadTransport := &uploadContextTransport{base: baseTransport}
+	contextClient := *httpClient
+	contextClient.Transport = uploadTransport
+	options = append(options, proxmox.WithHTTPClient(&contextClient), proxmox.WithLogger(capmox.Logger{}))
 	upstreamClient := proxmox.NewClient(proxmoxAPIURL, options...)
 	version, err := upstreamClient.Version(ctx)
 	if err != nil {
@@ -62,8 +108,9 @@ func NewAPIClient(ctx context.Context, logger logr.Logger, baseURL string, optio
 	logger.Info("Proxmox server", "version", version.Release)
 
 	return &APIClient{
-		Client: upstreamClient,
-		logger: logger,
+		Client:          upstreamClient,
+		logger:          logger,
+		uploadTransport: uploadTransport,
 	}, nil
 }
 
@@ -213,16 +260,25 @@ NEXT_VM:
 }
 
 // DeleteVM deletes a VM based on the nodeName and vmID.
-func (c *APIClient) DeleteVM(ctx context.Context, nodeName string, vmID int64) (*proxmox.Task, error) {
+func (c *APIClient) DeleteVM(ctx context.Context, nodeName string, vmID int64, machineIdentity string, upload *capmox.CloudInitUpload) (*proxmox.Task, error) {
 	// A vmID can not be lower than 100.
 	// If the provided vmID is lower (like -1 in issue #31), just error out without calling the API.
 	if vmID < 100 {
-		return nil, fmt.Errorf("vm with id %d does not exist", vmID)
+		return nil, fmt.Errorf("%w: vm id %d is below the minimum", ErrVMIDFree, vmID)
 	}
+	unlockDispatch := acquireCloudInitDispatch(machineIdentity)
+	defer unlockDispatch()
 
 	node := (&proxmox.Node{}).New(c.Client, nodeName)
 	if err := node.Status(ctx); err != nil {
 		return nil, fmt.Errorf("cannot find node with name %s: %w", nodeName, err)
+	}
+	recordedNode := node
+	if upload != nil && upload.Node != "" && upload.Node != nodeName {
+		recordedNode = (&proxmox.Node{}).New(c.Client, upload.Node)
+		if err := recordedNode.Status(ctx); err != nil {
+			return nil, fmt.Errorf("cannot find recorded cloud-init node with name %s: %w", upload.Node, err)
+		}
 	}
 
 	cluster, err := c.Cluster(ctx)
@@ -230,7 +286,24 @@ func (c *APIClient) DeleteVM(ctx context.Context, nodeName string, vmID int64) (
 		return nil, fmt.Errorf("cannot get cluster")
 	}
 
+	if upload != nil && upload.Phase != capmox.CloudInitUploadPhaseComplete {
+		if err := c.reconcileRecordedCloudInitUpload(ctx, recordedNode, machineIdentity, upload); err != nil {
+			return nil, fmt.Errorf("cannot reconcile recorded cloud-init upload before deleting vm id %d: %w", vmID, err)
+		}
+	}
 	if vmidFree, err := cluster.CheckID(ctx, int(vmID)); vmidFree {
+		if err := c.reconcileRecordedCloudInitUpload(ctx, recordedNode, machineIdentity, upload); err != nil {
+			return nil, fmt.Errorf("cannot reconcile recorded cloud-init upload for absent vm id %d: %w", vmID, err)
+		}
+		storage, volID, cleanupErr := recoverOwnedCloudInitVolume(ctx, node, machineIdentity)
+		if cleanupErr != nil {
+			return nil, fmt.Errorf("cannot recover untagged cloud-init ISO for absent vm id %d: %w", vmID, cleanupErr)
+		}
+		if storage != nil {
+			if _, cleanupErr := deleteOwnedCloudInitVolume(ctx, storage, volID); cleanupErr != nil {
+				return nil, fmt.Errorf("cannot delete untagged cloud-init ISO for absent vm id %d: %w", vmID, cleanupErr)
+			}
+		}
 		return nil, ErrVMIDFree
 	} else if err != nil {
 		return nil, err
@@ -246,6 +319,11 @@ func (c *APIClient) DeleteVM(ctx context.Context, nodeName string, vmID int64) (
 			return nil, fmt.Errorf("cannot stop vm id %d: %w", vmID, err)
 		}
 	}
+	if vm.HasTag(proxmox.MakeTag(proxmox.TagCloudInit)) {
+		if err := c.UnmountCloudInitISO(ctx, vm, machineIdentity, "ide0"); err != nil {
+			return nil, fmt.Errorf("cannot clean cloud-init ISO before deleting vm id %d: %w", vmID, err)
+		}
+	}
 
 	task, err := vm.Delete(ctx)
 	if err != nil {
@@ -253,6 +331,100 @@ func (c *APIClient) DeleteVM(ctx context.Context, nodeName string, vmID int64) (
 	}
 
 	return task, nil
+}
+
+func (c *APIClient) reconcileRecordedCloudInitUpload(ctx context.Context, node *proxmox.Node, machineIdentity string, upload *capmox.CloudInitUpload) error {
+	if upload == nil {
+		return nil
+	}
+	if err := validateRecordedCloudInitUpload(node, machineIdentity, upload); err != nil {
+		return err
+	}
+	storage, err := node.Storage(ctx, upload.Storage)
+	if err != nil {
+		return fmt.Errorf("get recorded cloud-init storage %q: %w", upload.Storage, err)
+	}
+	if err := c.waitForRecordedCloudInitUpload(ctx, node, upload); err != nil {
+		return err
+	}
+	isoName := strings.TrimPrefix(upload.VolID, upload.Storage+":iso/")
+	present, err := inspectCloudInitISO(ctx, storage, upload.Storage, isoName, upload.Size)
+	if err != nil {
+		return fmt.Errorf("inspect recorded cloud-init upload %q: %w", upload.VolID, err)
+	}
+	if !present {
+		return nil
+	}
+	if _, err := deleteOwnedCloudInitVolume(ctx, storage, upload.VolID); err != nil {
+		return fmt.Errorf("delete recorded cloud-init upload %q: %w", upload.VolID, err)
+	}
+	return nil
+}
+
+func validateRecordedCloudInitUpload(node *proxmox.Node, machineIdentity string, upload *capmox.CloudInitUpload) error {
+	if upload.Version != 1 || upload.Node != node.Name || upload.Storage == "" || upload.Size == 0 {
+		return fmt.Errorf("invalid cloud-init upload record: version=%d node=%q storage=%q size=%d", upload.Version, upload.Node, upload.Storage, upload.Size)
+	}
+	switch upload.Phase {
+	case capmox.CloudInitUploadPhaseIntent:
+		if upload.UPID != "" {
+			return errors.New("cloud-init upload intent unexpectedly contains a task UPID")
+		}
+	case capmox.CloudInitUploadPhaseDispatching:
+		if upload.UPID != "" || upload.DispatchOwner == "" || upload.LeaseUntilUnix == 0 {
+			return errors.New("dispatching cloud-init upload has invalid durable ownership")
+		}
+	case capmox.CloudInitUploadPhaseAccepted:
+		if upload.UPID == "" {
+			return errors.New("accepted cloud-init upload has no task UPID")
+		}
+	case capmox.CloudInitUploadPhaseComplete:
+	default:
+		return fmt.Errorf("invalid cloud-init upload phase %q", upload.Phase)
+	}
+	prefix := upload.Storage + ":iso/" + cloudInitStorageFilenamePrefix + machineIdentity + "-"
+	if !strings.HasPrefix(upload.VolID, prefix) || !strings.HasSuffix(upload.VolID, ".iso") {
+		return fmt.Errorf("recorded cloud-init volume %q is not owned by Machine %q on storage %q", upload.VolID, machineIdentity, upload.Storage)
+	}
+	digest := strings.TrimSuffix(strings.TrimPrefix(upload.VolID, prefix), ".iso")
+	if _, err := cloudInitISOName(machineIdentity, digest); err != nil {
+		return fmt.Errorf("invalid recorded cloud-init volume %q: %w", upload.VolID, err)
+	}
+	return nil
+}
+
+func (c *APIClient) waitForRecordedCloudInitUpload(ctx context.Context, node *proxmox.Node, upload *capmox.CloudInitUpload) error {
+	if upload.Phase == capmox.CloudInitUploadPhaseIntent || upload.Phase == capmox.CloudInitUploadPhaseDispatching {
+		if upload.DispatchOwner == "" && upload.LeaseUntilUnix != 0 {
+			return errors.New("cloud-init upload intent has a lease without an owner")
+		}
+		if upload.DispatchOwner != "" && upload.LeaseUntilUnix > cloudInitDispatchNow().Unix() {
+			return fmt.Errorf("%w: durable cloud-init dispatch owner %q remains live", capmox.ErrCloudInitUploadPending, upload.DispatchOwner)
+		}
+		if err := requireCloudInitUploadQuiescence(ctx, node); err != nil {
+			return err
+		}
+	}
+	if upload.UPID != "" && upload.Phase != capmox.CloudInitUploadPhaseComplete {
+		task, err := c.GetTask(ctx, upload.UPID)
+		if err != nil {
+			storage, storageErr := node.Storage(ctx, upload.Storage)
+			if storageErr != nil {
+				return fmt.Errorf("%w: get recorded storage after upload task %q became unavailable: %v", capmox.ErrCloudInitUploadPending, upload.UPID, storageErr)
+			}
+			isoName := strings.TrimPrefix(upload.VolID, upload.Storage+":iso/")
+			if _, proofErr := proveCloudInitUploadWithoutTask(ctx, node, storage, upload.Storage, isoName, upload.Size); proofErr != nil {
+				return fmt.Errorf("%w: recorded upload task %q is unavailable (%v) and cleanup proof failed: %v", capmox.ErrCloudInitUploadPending, upload.UPID, err, proofErr)
+			}
+			return nil
+		}
+		waitErr := waitForCloudInitTask(ctx, task, 2)
+		taskFailed := task.IsFailed || (task.ExitStatus != "" && task.ExitStatus != "OK")
+		if waitErr != nil && !taskFailed {
+			return fmt.Errorf("recorded cloud-init upload task %q is not terminal: %w", upload.UPID, waitErr)
+		}
+	}
+	return nil
 }
 
 // CheckID checks if the vmid is available on the cluster.
@@ -344,17 +516,142 @@ func (c *APIClient) TagVM(ctx context.Context, vm *proxmox.VirtualMachine, tag s
 	return vm.AddTag(ctx, tag)
 }
 
-// UnmountCloudInitISO unmounts the cloud-init iso from VM.
-func (c *APIClient) UnmountCloudInitISO(ctx context.Context, vm *proxmox.VirtualMachine, device string) error {
-	err := vm.UnmountCloudInitISO(ctx, device)
+// UnmountCloudInitISO unmounts the cloud-init ISO and deletes only the exact
+// content-addressed volume mounted for the immutable ProxmoxMachine identity.
+func (c *APIClient) UnmountCloudInitISO(ctx context.Context, vm *proxmox.VirtualMachine, machineIdentity, device string) error {
+	if !vm.HasTag(proxmox.MakeTag(proxmox.TagCloudInit)) {
+		return nil
+	}
+	if vm.VirtualMachineConfig == nil || device != cloudInitDevice {
+		return fmt.Errorf("unable to prove mounted cloud-init device %q", device)
+	}
+	node, err := c.Node(ctx, vm.Node)
 	if err != nil {
-		return fmt.Errorf("unable to unmount cloud-init iso: %w", err)
+		return fmt.Errorf("get cloud-init node: %w", err)
 	}
 
-	if vm.HasTag(proxmox.MakeTag(proxmox.TagCloudInit)) {
-		_, err = vm.RemoveTag(ctx, proxmox.MakeTag(proxmox.TagCloudInit))
+	deviceValue := vm.VirtualMachineConfig.IDE0
+	var storage *proxmox.Storage
+	var volID string
+	if deviceValue == "" || deviceValue == cloudInitUnmountedDeviceValue {
+		storage, volID, err = recoverOwnedCloudInitVolume(ctx, node, machineIdentity)
+		if err != nil {
+			return err
+		}
+	} else {
+		storageName, mountedVolID, proofErr := ownedCloudInitVolume(deviceValue, machineIdentity)
+		if proofErr != nil {
+			legacyStorageName, legacyVolID, legacyErr := legacyCloudInitVolume(deviceValue, vm.VMID)
+			if legacyErr == nil {
+				storageName, mountedVolID, proofErr = legacyStorageName, legacyVolID, nil
+			} else {
+				// A foreign target device is outside CAPMOX authority. Preserve it, but
+				// still recover and delete the sole unattached Machine-owned artifact.
+				storage, volID, err = recoverOwnedCloudInitVolume(ctx, node, machineIdentity)
+				if err != nil {
+					return fmt.Errorf("recover unattached cloud-init artifact while preserving foreign device: %w", err)
+				}
+			}
+		}
+		if proofErr == nil {
+			storage, err = node.Storage(ctx, storageName)
+			if err != nil {
+				return fmt.Errorf("get cloud-init storage %q: %w", storageName, err)
+			}
+			if _, err := inspectOwnedCloudInitVolume(ctx, storage, mountedVolID); err != nil {
+				return fmt.Errorf("inspect mounted cloud-init volume: %w", err)
+			}
+			volID = mountedVolID
+			unmountTask, unmountErr := vm.Config(ctx, proxmox.VirtualMachineOption{Name: device, Value: cloudInitUnmountedDeviceValue})
+			if unmountErr != nil {
+				return fmt.Errorf("unable to unmount cloud-init iso: %w", unmountErr)
+			}
+			if err := waitForCloudInitEffect(ctx, unmountTask, 2, "cloud-init ISO unmount", false, func() error {
+				return requireCloudInitUnmount(ctx, vm, device)
+			}); err != nil {
+				return err
+			}
+		}
 	}
-	return err
+	if storage != nil {
+		if _, err := deleteOwnedCloudInitVolume(ctx, storage, volID); err != nil {
+			return fmt.Errorf("delete exact cloud-init volume %q: %w", volID, err)
+		}
+	}
+
+	removeTagTask, err := vm.RemoveTag(ctx, proxmox.MakeTag(proxmox.TagCloudInit))
+	if err != nil && !proxmox.IsErrNoop(err) {
+		return err
+	}
+	if err == nil {
+		waitErr := waitForCloudInitEffect(ctx, removeTagTask, 2, "cloud-init ownership tag removal", false, func() error {
+			if err := vm.Ping(ctx); err != nil {
+				return fmt.Errorf("refetch VM config: %w", err)
+			}
+			if vm.HasTag(proxmox.MakeTag(proxmox.TagCloudInit)) {
+				return errors.New("cloud-init ownership tag remains present")
+			}
+			return nil
+		})
+		if waitErr != nil {
+			if refreshErr := vm.Ping(ctx); refreshErr != nil {
+				return fmt.Errorf("%w; refetch VM config after failed ownership tag removal: %v", waitErr, refreshErr)
+			}
+			return waitErr
+		}
+		return nil
+	}
+	return nil
+}
+
+func requireCloudInitUnmount(ctx context.Context, vm *proxmox.VirtualMachine, device string) error {
+	if err := vm.Ping(ctx); err != nil {
+		return fmt.Errorf("refetch VM config: %w", err)
+	}
+	if deviceValue := cloudInitDeviceValue(vm, device); deviceValue != "" && deviceValue != cloudInitUnmountedDeviceValue {
+		return fmt.Errorf("cloud-init device %q remains mounted as %q", device, deviceValue)
+	}
+	return nil
+}
+
+func recoverOwnedCloudInitVolume(ctx context.Context, node *proxmox.Node, machineIdentity string) (*proxmox.Storage, string, error) {
+	if _, err := cloudInitISOName(machineIdentity, strings.Repeat("0", cloudInitDigestLength)); err != nil {
+		return nil, "", err
+	}
+	storages, err := node.Storages(ctx)
+	if err != nil {
+		return nil, "", fmt.Errorf("list ISO storages for cloud-init recovery: %w", err)
+	}
+	var matchedStorage *proxmox.Storage
+	var matchedVolID string
+	for _, storage := range storages {
+		contents, err := storage.GetContent(ctx)
+		if err != nil {
+			return nil, "", fmt.Errorf("inspect storage %q for cloud-init recovery: %w", storage.Name, err)
+		}
+		volID, found, err := ownedCloudInitCandidate(contents, machineIdentity)
+		if err != nil {
+			return nil, "", err
+		}
+		if !found {
+			continue
+		}
+		if matchedStorage != nil {
+			return nil, "", fmt.Errorf("multiple owned cloud-init volumes found for Machine %q", machineIdentity)
+		}
+		matchedStorage = storage
+		matchedVolID = volID
+	}
+	return matchedStorage, matchedVolID, nil
+}
+
+func storageSupportsContent(configured, expected string) bool {
+	for content := range strings.SplitSeq(configured, ",") {
+		if content == expected {
+			return true
+		}
+	}
+	return false
 }
 
 // CloudInitStatus returns the cloud-init status of the VM.
