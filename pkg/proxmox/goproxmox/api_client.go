@@ -295,7 +295,11 @@ func (c *APIClient) DeleteVM(ctx context.Context, nodeName string, vmID int64, m
 		if err := c.reconcileRecordedCloudInitUpload(ctx, recordedNode, machineIdentity, upload); err != nil {
 			return nil, fmt.Errorf("cannot reconcile recorded cloud-init upload for absent vm id %d: %w", vmID, err)
 		}
-		storage, volID, cleanupErr := recoverOwnedCloudInitVolume(ctx, node, machineIdentity)
+		recoverVolume := recoverOwnedCloudInitVolume
+		if upload == nil {
+			recoverVolume = recoverLegacyOwnedCloudInitVolume
+		}
+		storage, volID, cleanupErr := recoverVolume(ctx, node, machineIdentity)
 		if cleanupErr != nil {
 			return nil, fmt.Errorf("cannot recover untagged cloud-init ISO for absent vm id %d: %w", vmID, cleanupErr)
 		}
@@ -615,6 +619,14 @@ func requireCloudInitUnmount(ctx context.Context, vm *proxmox.VirtualMachine, de
 }
 
 func recoverOwnedCloudInitVolume(ctx context.Context, node *proxmox.Node, machineIdentity string) (*proxmox.Storage, string, error) {
+	return recoverOwnedCloudInitVolumeFrom(ctx, node, machineIdentity, func(*proxmox.Storage) bool { return true })
+}
+
+func recoverLegacyOwnedCloudInitVolume(ctx context.Context, node *proxmox.Node, machineIdentity string) (*proxmox.Storage, string, error) {
+	return recoverOwnedCloudInitVolumeFrom(ctx, node, machineIdentity, cloudInitISOStorageEligible)
+}
+
+func recoverOwnedCloudInitVolumeFrom(ctx context.Context, node *proxmox.Node, machineIdentity string, include func(*proxmox.Storage) bool) (*proxmox.Storage, string, error) {
 	if _, err := cloudInitISOName(machineIdentity, strings.Repeat("0", cloudInitDigestLength)); err != nil {
 		return nil, "", err
 	}
@@ -625,6 +637,9 @@ func recoverOwnedCloudInitVolume(ctx context.Context, node *proxmox.Node, machin
 	var matchedStorage *proxmox.Storage
 	var matchedVolID string
 	for _, storage := range storages {
+		if !include(storage) {
+			continue
+		}
 		contents, err := storage.GetContent(ctx)
 		if err != nil {
 			return nil, "", fmt.Errorf("inspect storage %q for cloud-init recovery: %w", storage.Name, err)
@@ -643,6 +658,10 @@ func recoverOwnedCloudInitVolume(ctx context.Context, node *proxmox.Node, machin
 		matchedVolID = volID
 	}
 	return matchedStorage, matchedVolID, nil
+}
+
+func cloudInitISOStorageEligible(storage *proxmox.Storage) bool {
+	return storage.Enabled != 0 && storageSupportsContent(storage.Content, cloudInitISOContentType)
 }
 
 func storageSupportsContent(configured, expected string) bool {

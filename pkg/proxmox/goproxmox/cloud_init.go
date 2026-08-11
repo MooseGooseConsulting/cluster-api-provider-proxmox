@@ -557,7 +557,7 @@ func findCloudInitUploadTarget(ctx context.Context, node *proxmox.Node, machineI
 	var supersededStorage *proxmox.Storage
 	var supersededVolID string
 	for _, storage := range storages {
-		if storage.Enabled == 0 || !storageSupportsContent(storage.Content, cloudInitISOContentType) {
+		if !cloudInitISOStorageEligible(storage) {
 			continue
 		}
 		contents, err := storage.GetContent(ctx)
@@ -605,7 +605,7 @@ func findCloudInitUploadTarget(ctx context.Context, node *proxmox.Node, machineI
 			if content.Format != cloudInitISOContentType || content.Size != size {
 				return nil, fmt.Errorf("volume %q metadata mismatched: format=%q size=%d expected_size=%d", expectedVolID, content.Format, content.Size, size)
 			}
-			if storage.Enabled == 0 || !storageSupportsContent(storage.Content, cloudInitISOContentType) {
+			if !cloudInitISOStorageEligible(storage) {
 				return nil, fmt.Errorf("exact cloud-init artifact %q exists on ineligible storage %q", isoName, storage.Name)
 			}
 			matched = storage
