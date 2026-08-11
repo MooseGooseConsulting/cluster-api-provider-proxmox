@@ -202,13 +202,21 @@ func (m *MachineScope) PatchObject() error {
 	)
 
 	// Patch the ProxmoxMachine resource.
-	return m.patchHelper.Patch(
+	if err := m.patchHelper.Patch(
 		context.TODO(),
 		m.ProxmoxMachine,
 		patch.WithOwnedConditions{Conditions: []string{
 			"Ready",
 			infrav1.ProxmoxMachineVirtualMachineProvisionedCondition,
-		}})
+		}}); err != nil {
+		return err
+	}
+	patchHelper, err := patch.NewHelper(m.ProxmoxMachine, m.client)
+	if err != nil {
+		return errors.Wrap(err, "refresh machine patch helper")
+	}
+	m.patchHelper = patchHelper
+	return nil
 }
 
 // SetAddresses sets the addresses in the status.

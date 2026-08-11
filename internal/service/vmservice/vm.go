@@ -572,5 +572,8 @@ func getUsedVMIDs(ctx context.Context, scope *scope.MachineScope) ([]int64, erro
 var selectNextNode = scheduler.ScheduleVM
 
 func unmountCloudInitISO(ctx context.Context, machineScope *scope.MachineScope) error {
-	return machineScope.InfraCluster.ProxmoxClient.UnmountCloudInitISO(ctx, machineScope.VirtualMachine, string(machineScope.ProxmoxMachine.UID), inject.CloudInitISODevice)
+	if err := machineScope.InfraCluster.ProxmoxClient.UnmountCloudInitISO(ctx, machineScope.VirtualMachine, string(machineScope.ProxmoxMachine.UID), inject.CloudInitISODevice); err != nil {
+		return err
+	}
+	return clearCompletedCloudInitUploadState(machineScope)
 }

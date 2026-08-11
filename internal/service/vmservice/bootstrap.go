@@ -94,6 +94,10 @@ func reconcileBootstrapData(ctx context.Context, machineScope *scope.MachineScop
 		err = injectCloudInit(ctx, machineScope, bootstrapData, biosUUID, nicData, kubernetesVersion)
 	}
 	if err != nil {
+		if errors.Is(err, capmox.ErrCloudInitStorageDiscoveryRetryable) {
+			machineScope.Logger.V(2).Info("cloud-init storage discovery will be retried", "error", err.Error())
+			return true, errors.Wrap(err, "retry cloud-init storage discovery")
+		}
 		// Todo: test this (colliding default gateways for example)
 		conditions.Set(machineScope.ProxmoxMachine, metav1.Condition{
 			Type:    infrav1.ProxmoxMachineVirtualMachineProvisionedCondition,
@@ -180,24 +184,48 @@ const cloudInitUploadAnnotation = "infrastructure.cluster.x-k8s.io/cloud-init-up
 
 func cloudInitUploadRecorder(machineScope *scope.MachineScope) capmox.CloudInitUploadRecorder {
 	return func(upload capmox.CloudInitUpload) error {
+		return persistCloudInitUploadState(machineScope, &upload)
+	}
+}
+
+func persistCloudInitUploadState(machineScope *scope.MachineScope, upload *capmox.CloudInitUpload) error {
+	previous := maps.Clone(machineScope.ProxmoxMachine.GetAnnotations())
+	annotations := maps.Clone(previous)
+	if annotations == nil {
+		annotations = map[string]string{}
+	}
+	if upload == nil {
+		if _, exists := annotations[cloudInitUploadAnnotation]; !exists {
+			return nil
+		}
+		delete(annotations, cloudInitUploadAnnotation)
+	} else {
 		encoded, err := json.Marshal(upload)
 		if err != nil {
 			return errors.Wrap(err, "encode cloud-init upload state")
-		}
-		annotations := machineScope.ProxmoxMachine.GetAnnotations()
-		if annotations == nil {
-			annotations = map[string]string{}
 		}
 		if annotations[cloudInitUploadAnnotation] == string(encoded) {
 			return nil
 		}
 		annotations[cloudInitUploadAnnotation] = string(encoded)
-		machineScope.ProxmoxMachine.SetAnnotations(annotations)
-		if err := machineScope.PatchObject(); err != nil {
-			return errors.Wrap(err, "persist cloud-init upload state")
-		}
-		return nil
 	}
+	machineScope.ProxmoxMachine.SetAnnotations(annotations)
+	if err := machineScope.PatchObject(); err != nil {
+		machineScope.ProxmoxMachine.SetAnnotations(previous)
+		return errors.Wrap(err, "persist cloud-init upload state")
+	}
+	return nil
+}
+
+func clearCompletedCloudInitUploadState(machineScope *scope.MachineScope) error {
+	upload, err := cloudInitUploadState(machineScope)
+	if err != nil || upload == nil {
+		return err
+	}
+	if upload.Phase != capmox.CloudInitUploadPhaseComplete {
+		return fmt.Errorf("refusing to clear non-complete cloud-init upload phase %q", upload.Phase)
+	}
+	return persistCloudInitUploadState(machineScope, nil)
 }
 
 func cloudInitUploadState(machineScope *scope.MachineScope) (*capmox.CloudInitUpload, error) {

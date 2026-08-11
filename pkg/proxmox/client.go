@@ -19,9 +19,14 @@ package proxmox
 
 import (
 	"context"
+	"errors"
 
 	"github.com/luthermonson/go-proxmox"
 )
+
+// ErrCloudInitStorageDiscoveryRetryable marks storage inventory/capacity state
+// that must be retried without terminalizing Machine provisioning.
+var ErrCloudInitStorageDiscoveryRetryable = errors.New("cloud-init storage discovery is retryable")
 
 // CloudInitUpload records the durable identity and progress of one immutable
 // cloud-init upload. Callers persist each update before CloudInit continues.

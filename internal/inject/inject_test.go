@@ -133,7 +133,7 @@ func TestISOInjectorInjectCloudInit(t *testing.T) {
 	}
 
 	httpmock.RegisterResponder(http.MethodGet, fmt.Sprintf(`=~/nodes/%s/storage$`, "pve"),
-		newJSONResponder(200, &proxmox.Storages{{Name: "iso", Content: "iso", Enabled: 1}}, 1))
+		newJSONResponder(200, &proxmox.Storages{{Name: "iso", Content: "iso", Enabled: 1, Avail: 1 << 30}}, 1))
 
 	ptask := &proxmox.Task{
 		UPID:      "UPID:pve:003B4235:1DF4ABCA:667C1C45:vncproxy:103:root@pam:",
@@ -262,7 +262,7 @@ func TestISOInjectorInjectIgnition(t *testing.T) {
 	}
 
 	httpmock.RegisterResponder(http.MethodGet, fmt.Sprintf(`=~/nodes/%s/storage$`, "pve"),
-		newJSONResponder(200, &proxmox.Storages{{Name: "iso", Content: "iso", Enabled: 1}}, 1))
+		newJSONResponder(200, &proxmox.Storages{{Name: "iso", Content: "iso", Enabled: 1, Avail: 1 << 30}}, 1))
 
 	ptask := &proxmox.Task{
 		UPID:      "UPID:pve:003B4235:1DF4ABCA:667C1C45:vncproxy:103:root@pam:",

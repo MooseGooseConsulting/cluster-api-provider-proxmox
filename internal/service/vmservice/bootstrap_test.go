@@ -30,6 +30,9 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/cluster-api/util/conditions"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	ipamicv1 "sigs.k8s.io/cluster-api-ipam-provider-in-cluster/api/v1alpha2"
 
@@ -281,6 +284,83 @@ func TestReconcileBootstrapData_BadInjector(t *testing.T) {
 	require.False(t, requeue)
 	require.True(t, conditions.Has(machineScope.ProxmoxMachine, infrav1.ProxmoxMachineVirtualMachineProvisionedCondition))
 	require.Nil(t, machineScope.ProxmoxMachine.Status.BootstrapDataProvided)
+}
+
+func TestReconcileBootstrapData_RetriesStorageDiscoveryWithoutTerminalFailure(t *testing.T) {
+	machineScope, _, kubeClient := setupReconcilerTestWithCondition(t, infrav1.ProxmoxMachineVirtualMachineProvisionedWaitingForBootstrapDataReconciliationReason)
+	setupVMWithMetadata(machineScope)
+	createBootstrapSecret(t, kubeClient, machineScope, cloudinit.FormatCloudConfig)
+	defaultPool := addDefaultIPPool(machineScope)
+	createIPPools(t, kubeClient, machineScope)
+	createIPAddress(t, kubeClient, machineScope, infrav1.DefaultNetworkDevice, "10.10.10.10", 0, &defaultPool)
+	getISOInjector = func(_ capmox.Client, _ string, _ *proxmox.VirtualMachine, _ []byte, _, _ cloudinit.Renderer, _ capmox.CloudInitUploadRecorder) isoInjector {
+		return FakeISOInjector{Error: fmt.Errorf("%w: temporary storage inventory failure", capmox.ErrCloudInitStorageDiscoveryRetryable)}
+	}
+	t.Cleanup(func() { getISOInjector = defaultISOInjector })
+
+	requeue, err := reconcileBootstrapData(context.Background(), machineScope)
+	require.ErrorIs(t, err, capmox.ErrCloudInitStorageDiscoveryRetryable)
+	require.True(t, requeue)
+	require.Equal(t, infrav1.ProxmoxMachineVirtualMachineProvisionedWaitingForBootstrapDataReconciliationReason,
+		conditions.GetReason(machineScope.ProxmoxMachine, infrav1.ProxmoxMachineVirtualMachineProvisionedCondition))
+	require.Nil(t, machineScope.ProxmoxMachine.Status.BootstrapDataProvided)
+}
+
+func TestCloudInitUploadRecorderRestoresPriorAnnotationWhenPatchFails(t *testing.T) {
+	originalScope, _, kubeClient := setupReconcilerTest(t)
+	originalScope.ProxmoxMachine.Annotations = map[string]string{"stable": "kept"}
+	patchCalls := 0
+	failPatch := true
+	patchErr := errors.New("transient patch failure")
+	failingClient := fake.NewClientBuilder().
+		WithScheme(kubeClient.Scheme()).
+		WithObjects(originalScope.ProxmoxMachine.DeepCopy()).
+		WithStatusSubresource(&infrav1.ProxmoxMachine{}).
+		WithInterceptorFuncs(interceptor.Funcs{Patch: func(ctx context.Context, inner client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+			patchCalls++
+			if failPatch {
+				return patchErr
+			}
+			return inner.Patch(ctx, obj, patch, opts...)
+		}}).
+		Build()
+	machineScope, err := scope.NewMachineScope(scope.MachineScopeParams{
+		Client:         failingClient,
+		Logger:         originalScope.Logger,
+		Cluster:        originalScope.Cluster,
+		Machine:        originalScope.Machine,
+		InfraCluster:   originalScope.InfraCluster,
+		ProxmoxMachine: originalScope.ProxmoxMachine,
+		IPAMHelper:     originalScope.IPAMHelper,
+	})
+	require.NoError(t, err)
+	upload := capmox.CloudInitUpload{Version: 1, Node: "pve", Storage: "local", VolID: "local:iso/owned.iso", Size: 4096, Phase: capmox.CloudInitUploadPhaseIntent}
+
+	err = cloudInitUploadRecorder(machineScope)(upload)
+	require.ErrorIs(t, err, patchErr)
+	require.Equal(t, map[string]string{"stable": "kept"}, machineScope.ProxmoxMachine.Annotations,
+		"failed durable write must not leave a false intent for deferred Close")
+	failPatch = false
+	require.NoError(t, machineScope.Close())
+	stored := &infrav1.ProxmoxMachine{}
+	require.NoError(t, failingClient.Get(context.Background(), client.ObjectKeyFromObject(machineScope.ProxmoxMachine), stored))
+	require.Equal(t, "kept", stored.Annotations["stable"])
+	require.NotContains(t, stored.Annotations, cloudInitUploadAnnotation)
+
+	upload.Phase = capmox.CloudInitUploadPhaseComplete
+	require.NoError(t, cloudInitUploadRecorder(machineScope)(upload))
+	failPatch = true
+	err = clearCompletedCloudInitUploadState(machineScope)
+	require.ErrorIs(t, err, patchErr)
+	state, stateErr := cloudInitUploadState(machineScope)
+	require.NoError(t, stateErr)
+	require.Equal(t, capmox.CloudInitUploadPhaseComplete, state.Phase,
+		"failed durable clear must restore the completed record for retry")
+	failPatch = false
+	require.NoError(t, machineScope.Close())
+	require.NoError(t, failingClient.Get(context.Background(), client.ObjectKeyFromObject(machineScope.ProxmoxMachine), stored))
+	require.Contains(t, stored.Annotations, cloudInitUploadAnnotation)
+	require.Equal(t, 3, patchCalls, "only the intent, complete, and clear boundaries require API patches")
 }
 
 func TestGetBootstrapData_MissingSecretName(t *testing.T) {

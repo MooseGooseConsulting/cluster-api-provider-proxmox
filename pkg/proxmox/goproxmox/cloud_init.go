@@ -198,19 +198,22 @@ type cloudInitUploadSelection struct {
 func findCloudInitUploadTarget(ctx context.Context, node *proxmox.Node, machineIdentity, isoName string, size uint64) (*cloudInitUploadSelection, error) {
 	storages, err := node.Storages(ctx)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: list node storages: %v", capmox.ErrCloudInitStorageDiscoveryRetryable, err)
 	}
 	var eligible *proxmox.Storage
 	var matched *proxmox.Storage
 	var supersededStorage *proxmox.Storage
 	var supersededVolID string
 	for _, storage := range storages {
-		if storage.Enabled != 0 && storageSupportsContent(storage.Content, cloudInitISOContentType) && eligible == nil {
+		if storage.Enabled == 0 || !storageSupportsContent(storage.Content, cloudInitISOContentType) {
+			continue
+		}
+		if storage.Avail >= size && (eligible == nil || storage.Name < eligible.Name) {
 			eligible = storage
 		}
 		contents, err := storage.GetContent(ctx)
 		if err != nil {
-			return nil, fmt.Errorf("inspect storage %q before cloud-init upload: %w", storage.Name, err)
+			return nil, fmt.Errorf("%w: inspect relevant ISO storage %q: %v", capmox.ErrCloudInitStorageDiscoveryRetryable, storage.Name, err)
 		}
 		expectedVolID := fmt.Sprintf("%s:iso/%s", storage.Name, isoName)
 		candidate, found, err := ownedCloudInitCandidate(contents, machineIdentity)
@@ -248,7 +251,7 @@ func findCloudInitUploadTarget(ctx context.Context, node *proxmox.Node, machineI
 		return &cloudInitUploadSelection{storage: matched, supersededStorage: supersededStorage, supersededVolID: supersededVolID}, nil
 	}
 	if eligible == nil {
-		return nil, errors.New("no enabled ISO storage found")
+		return nil, fmt.Errorf("%w: no enabled ISO storage has %d bytes available", capmox.ErrCloudInitStorageDiscoveryRetryable, size)
 	}
 	return &cloudInitUploadSelection{storage: eligible, supersededStorage: supersededStorage, supersededVolID: supersededVolID}, nil
 }
@@ -283,21 +286,28 @@ func (c *APIClient) reconcileSupersededCloudInitArtifact(ctx context.Context, vm
 
 func addCloudInitOwnershipTag(ctx context.Context, vm *proxmox.VirtualMachine) error {
 	tagTask, err := vm.AddTag(ctx, proxmox.MakeTag(proxmox.TagCloudInit))
-	if err != nil && !proxmox.IsErrNoop(err) {
-		return err
+	if err != nil {
+		if proxmox.IsErrNoop(err) {
+			return nil
+		}
+		if !isAmbiguousTransportError(err) {
+			return err
+		}
+		if proofErr := requireCloudInitOwnershipTag(ctx, vm); proofErr != nil {
+			return fmt.Errorf("cloud-init ownership tag response was ambiguous (%w) and exact tag proof failed: %v", err, proofErr)
+		}
+		return nil
 	}
-	if err == nil {
-		if tagTask == nil {
-			return errors.New("cloud-init ownership tag returned no task")
-		}
-		waitErr := waitForCloudInitTask(ctx, tagTask, 2)
-		if tagTask.IsFailed || (tagTask.ExitStatus != "" && tagTask.ExitStatus != "OK") {
-			return fmt.Errorf("cloud-init ownership tag task failed with exit status %q", tagTask.ExitStatus)
-		}
-		if waitErr != nil {
-			if proofErr := requireCloudInitOwnershipTag(ctx, vm); proofErr != nil {
-				return fmt.Errorf("cloud-init ownership tag task wait was ambiguous (%w) and exact tag proof failed: %v", waitErr, proofErr)
-			}
+	if tagTask == nil {
+		return errors.New("cloud-init ownership tag returned no task")
+	}
+	waitErr := waitForCloudInitTask(ctx, tagTask, 2)
+	if tagTask.IsFailed || (tagTask.ExitStatus != "" && tagTask.ExitStatus != "OK") {
+		return fmt.Errorf("cloud-init ownership tag task failed with exit status %q", tagTask.ExitStatus)
+	}
+	if waitErr != nil {
+		if proofErr := requireCloudInitOwnershipTag(ctx, vm); proofErr != nil {
+			return fmt.Errorf("cloud-init ownership tag task wait was ambiguous (%w) and exact tag proof failed: %v", waitErr, proofErr)
 		}
 	}
 	return nil
@@ -605,7 +615,7 @@ func deleteOwnedCloudInitVolume(ctx context.Context, storage cloudInitStorage, v
 	}
 	task, err := storage.DeleteContent(ctx, volID)
 	if err != nil {
-		if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+		if !isAmbiguousTransportError(err) {
 			return false, err
 		}
 		stillPresent, proofErr := inspectOwnedCloudInitVolume(ctx, storage, volID)

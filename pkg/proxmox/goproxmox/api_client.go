@@ -432,7 +432,7 @@ func (c *APIClient) UnmountCloudInitISO(ctx context.Context, vm *proxmox.Virtual
 	if !vm.HasTag(proxmox.MakeTag(proxmox.TagCloudInit)) {
 		return nil
 	}
-	if vm.VirtualMachineConfig == nil || device != "ide0" {
+	if vm.VirtualMachineConfig == nil || device != cloudInitDevice {
 		return fmt.Errorf("unable to prove mounted cloud-init device %q", device)
 	}
 	node, err := c.Node(ctx, vm.Node)
@@ -470,8 +470,10 @@ func (c *APIClient) UnmountCloudInitISO(ctx context.Context, vm *proxmox.Virtual
 			if unmountErr != nil {
 				return fmt.Errorf("unable to unmount cloud-init iso: %w", unmountErr)
 			}
-			if err := unmountTask.WaitFor(ctx, 2); err != nil {
-				return fmt.Errorf("wait for cloud-init unmount: %w", err)
+			if err := waitForCloudInitEffect(ctx, unmountTask, 2, "cloud-init ISO unmount", false, func() error {
+				return requireCloudInitUnmount(ctx, vm, device)
+			}); err != nil {
+				return err
 			}
 		}
 	}
@@ -487,6 +489,16 @@ func (c *APIClient) UnmountCloudInitISO(ctx context.Context, vm *proxmox.Virtual
 	}
 	if err == nil {
 		return removeTagTask.WaitFor(ctx, 2)
+	}
+	return nil
+}
+
+func requireCloudInitUnmount(ctx context.Context, vm *proxmox.VirtualMachine, device string) error {
+	if err := vm.Ping(ctx); err != nil {
+		return fmt.Errorf("refetch VM config: %w", err)
+	}
+	if deviceValue := cloudInitDeviceValue(vm, device); deviceValue != "" && deviceValue != cloudInitUnmountedDeviceValue {
+		return fmt.Errorf("cloud-init device %q remains mounted as %q", device, deviceValue)
 	}
 	return nil
 }
