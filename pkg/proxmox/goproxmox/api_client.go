@@ -309,6 +309,11 @@ func (c *APIClient) reconcileRecordedCloudInitUpload(ctx context.Context, node *
 	if err != nil {
 		return fmt.Errorf("get recorded cloud-init storage %q: %w", upload.Storage, err)
 	}
+	if upload.Phase == capmox.CloudInitUploadPhaseIntent {
+		if err := requireCloudInitUploadQuiescence(ctx, node); err != nil {
+			return err
+		}
+	}
 	if upload.UPID != "" && upload.Phase != capmox.CloudInitUploadPhaseComplete {
 		task, err := c.GetTask(ctx, upload.UPID)
 		if err != nil {
@@ -326,9 +331,6 @@ func (c *APIClient) reconcileRecordedCloudInitUpload(ctx context.Context, node *
 		return fmt.Errorf("inspect recorded cloud-init upload %q: %w", upload.VolID, err)
 	}
 	if !present {
-		if upload.Phase == capmox.CloudInitUploadPhaseIntent && upload.UPID == "" {
-			return fmt.Errorf("cloud-init upload intent for %q has no terminal task or artifact proof", upload.VolID)
-		}
 		return nil
 	}
 	if _, err := deleteOwnedCloudInitVolume(ctx, storage, upload.VolID); err != nil {

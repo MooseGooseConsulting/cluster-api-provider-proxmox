@@ -94,13 +94,24 @@ func (c *APIClient) CloudInit(ctx context.Context, vm *proxmox.VirtualMachine, m
 	if err := addCloudInitOwnershipTag(ctx, vm); err != nil {
 		return err
 	}
+	nextAttempt := uint64(1)
+	intentAlreadyRecorded := false
 	if current != nil {
-		handled, err := c.resumeCloudInitUpload(ctx, node, vm, machineIdentity, device, isoName, size, current, recorder)
+		handled, rearmed, err := c.resumeCloudInitUpload(ctx, node, vm, machineIdentity, device, isoName, size, current, recorder)
 		if err != nil {
 			return err
 		}
 		if handled {
 			return nil
+		}
+		if rearmed {
+			nextAttempt = current.Attempt
+			intentAlreadyRecorded = true
+		} else if current.Attempt > 0 {
+			if current.Attempt == ^uint64(0) {
+				return errors.New("cloud-init upload attempt generation overflow")
+			}
+			nextAttempt = current.Attempt + 1
 		}
 	}
 
@@ -122,10 +133,13 @@ func (c *APIClient) CloudInit(ctx context.Context, vm *proxmox.VirtualMachine, m
 		Storage: storage.Name,
 		VolID:   expectedVolID,
 		Size:    size,
+		Attempt: nextAttempt,
 		Phase:   capmox.CloudInitUploadPhaseIntent,
 	}
-	if err := recorder(uploadState); err != nil {
-		return fmt.Errorf("record cloud-init upload intent: %w", err)
+	if !intentAlreadyRecorded {
+		if err := recorder(uploadState); err != nil {
+			return fmt.Errorf("record cloud-init upload intent: %w", err)
+		}
 	}
 
 	uploadTask, proven, err := uploadCloudInitISO(ctx, storage, storage.Name, isoPath, isoName, digest, size)
@@ -155,64 +169,93 @@ func (c *APIClient) CloudInit(ctx context.Context, vm *proxmox.VirtualMachine, m
 	return mountCloudInitISO(ctx, vm, machineIdentity, device, expectedVolID)
 }
 
-func (c *APIClient) resumeCloudInitUpload(ctx context.Context, node *proxmox.Node, vm *proxmox.VirtualMachine, machineIdentity, device, isoName string, size uint64, current *capmox.CloudInitUpload, recorder capmox.CloudInitUploadRecorder) (bool, error) {
+func (c *APIClient) resumeCloudInitUpload(ctx context.Context, node *proxmox.Node, vm *proxmox.VirtualMachine, machineIdentity, device, isoName string, size uint64, current *capmox.CloudInitUpload, recorder capmox.CloudInitUploadRecorder) (bool, bool, error) {
 	if current.Version != 1 || current.Node != node.Name || current.Storage == "" || current.Size == 0 {
-		return true, fmt.Errorf("invalid durable cloud-init upload state: version=%d node=%q storage=%q size=%d", current.Version, current.Node, current.Storage, current.Size)
+		return true, false, fmt.Errorf("invalid durable cloud-init upload state: version=%d node=%q storage=%q size=%d", current.Version, current.Node, current.Storage, current.Size)
 	}
 	expectedVolID := current.Storage + ":iso/" + isoName
 	exact := current.VolID == expectedVolID && current.Size == size
 	if !exact {
 		if current.Phase == capmox.CloudInitUploadPhaseComplete {
-			return false, nil
+			return false, false, nil
 		}
 		if err := c.reconcileRecordedCloudInitUpload(ctx, node, machineIdentity, current); err != nil {
-			return true, fmt.Errorf("%w: reconcile superseded durable upload: %v", capmox.ErrCloudInitUploadPending, err)
+			return true, false, fmt.Errorf("%w: reconcile superseded durable upload: %v", capmox.ErrCloudInitUploadPending, err)
 		}
-		return false, nil
+		return false, false, nil
 	}
 	storage, err := node.Storage(ctx, current.Storage)
 	if err != nil {
-		return true, fmt.Errorf("%w: get recorded storage %q: %v", capmox.ErrCloudInitUploadPending, current.Storage, err)
+		return true, false, fmt.Errorf("%w: get recorded storage %q: %v", capmox.ErrCloudInitUploadPending, current.Storage, err)
 	}
 	switch current.Phase {
 	case capmox.CloudInitUploadPhaseIntent:
 		present, inspectErr := inspectCloudInitISO(ctx, storage, current.Storage, isoName, size)
-		if inspectErr != nil || !present {
-			return true, fmt.Errorf("%w: exact intent artifact is not yet proven: %v", capmox.ErrCloudInitUploadPending, inspectErr)
+		if inspectErr != nil {
+			return true, false, fmt.Errorf("%w: inspect exact intent artifact: %v", capmox.ErrCloudInitUploadPending, inspectErr)
+		}
+		if err := requireCloudInitUploadQuiescence(ctx, node); err != nil {
+			return true, false, err
+		}
+		if !present {
+			if current.Attempt == ^uint64(0) {
+				return true, false, errors.New("cloud-init upload attempt generation overflow")
+			}
+			rearmed := *current
+			rearmed.Attempt++
+			if rearmed.Attempt == 0 {
+				rearmed.Attempt = 1
+			}
+			if err := recorder(rearmed); err != nil {
+				return true, false, fmt.Errorf("rearm quiescent cloud-init upload intent: %w", err)
+			}
+			*current = rearmed
+			return false, true, nil
 		}
 	case capmox.CloudInitUploadPhaseAccepted:
 		if current.UPID == "" {
-			return true, errors.New("accepted durable cloud-init upload has no task UPID")
+			return true, false, errors.New("accepted durable cloud-init upload has no task UPID")
 		}
 		task, taskErr := c.GetTask(ctx, current.UPID)
 		if taskErr != nil {
-			return true, fmt.Errorf("%w: get accepted upload task %q: %v", capmox.ErrCloudInitUploadPending, current.UPID, taskErr)
+			return true, false, fmt.Errorf("%w: get accepted upload task %q: %v", capmox.ErrCloudInitUploadPending, current.UPID, taskErr)
 		}
 		waitErr := waitForCloudInitTask(ctx, task, 2)
 		if task.IsFailed || (task.ExitStatus != "" && task.ExitStatus != "OK") {
-			return true, fmt.Errorf("accepted cloud-init upload task failed with exit status %q", task.ExitStatus)
+			return true, false, fmt.Errorf("accepted cloud-init upload task failed with exit status %q", task.ExitStatus)
 		}
 		if proofErr := requireCloudInitISO(ctx, storage, current.Storage, isoName, size); proofErr != nil {
-			return true, fmt.Errorf("%w: accepted upload is not yet proven (wait=%v proof=%v)", capmox.ErrCloudInitUploadPending, waitErr, proofErr)
+			return true, false, fmt.Errorf("%w: accepted upload is not yet proven (wait=%v proof=%v)", capmox.ErrCloudInitUploadPending, waitErr, proofErr)
 		}
 	case capmox.CloudInitUploadPhaseComplete:
 		if err := requireCloudInitISO(ctx, storage, current.Storage, isoName, size); err != nil {
-			return true, fmt.Errorf("completed durable upload lost exact artifact proof: %w", err)
+			return true, false, fmt.Errorf("completed durable upload lost exact artifact proof: %w", err)
 		}
 	default:
-		return true, fmt.Errorf("invalid durable cloud-init upload phase %q", current.Phase)
+		return true, false, fmt.Errorf("invalid durable cloud-init upload phase %q", current.Phase)
 	}
 	if current.Phase != capmox.CloudInitUploadPhaseComplete {
 		completed := *current
 		completed.Phase = capmox.CloudInitUploadPhaseComplete
 		if err := recorder(completed); err != nil {
-			return true, fmt.Errorf("record resumed cloud-init upload completion: %w", err)
+			return true, false, fmt.Errorf("record resumed cloud-init upload completion: %w", err)
 		}
 	}
 	if err := mountCloudInitISO(ctx, vm, machineIdentity, device, expectedVolID); err != nil {
-		return true, err
+		return true, false, err
 	}
-	return true, nil
+	return true, false, nil
+}
+
+func requireCloudInitUploadQuiescence(ctx context.Context, node *proxmox.Node) error {
+	tasks, err := node.Tasks(ctx, &proxmox.NodeTasksOptions{Limit: 1, Source: "active", TypeFilter: "imgcopy"})
+	if err != nil {
+		return fmt.Errorf("%w: inspect active PVE cloud-init upload tasks: %v", capmox.ErrCloudInitUploadPending, err)
+	}
+	if len(tasks) != 0 {
+		return fmt.Errorf("%w: an active PVE imgcopy task may still materialize the recorded cloud-init artifact", capmox.ErrCloudInitUploadPending)
+	}
+	return nil
 }
 
 func validateCloudInitTargetDevice(vm *proxmox.VirtualMachine, machineIdentity, device string) error {

@@ -737,6 +737,44 @@ func TestDeleteVMWaitsForRecordedUploadThenCleansLateArtifact(t *testing.T) {
 	require.False(t, artifactPresent)
 }
 
+func TestDeleteVMIntentWaitsForImgcopyThenAllowsAbsentVMFinalization(t *testing.T) {
+	client := newTestClient(t)
+	digest := cloudInitBootstrapDigest("orphan", "metadata", "", "network")
+	isoName := "user-data-machine-uid-" + digest + ".iso"
+	upload := &capmox.CloudInitUpload{
+		Version: 1, Node: "test", Storage: "local", VolID: "local:iso/" + isoName,
+		Size: 4096, Attempt: 1, Phase: capmox.CloudInitUploadPhaseIntent,
+	}
+	active := true
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/test/status$`,
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": proxmox.Node{Name: "test"}}))
+	httpmock.RegisterResponder(http.MethodGet, `=~/cluster/status$`,
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": proxmox.NodeStatuses{{Name: "test"}}}))
+	httpmock.RegisterResponder(http.MethodGet, `=~/cluster/nextid$`,
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": "320"}))
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/test/storage/local/status$`,
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": proxmox.Storage{Name: "local", Content: "iso", Enabled: 1}}))
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/test/storage$`,
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": &proxmox.Storages{{Name: "local", Content: "iso", Enabled: 1}}}))
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/test/storage/local/content$`,
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": []*proxmox.StorageContent{}}))
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/test/tasks\?limit=1&source=active&typefilter=imgcopy$`, func(*http.Request) (*http.Response, error) {
+		tasks := []*proxmox.Task{}
+		if active {
+			tasks = append(tasks, &proxmox.Task{Type: "imgcopy", Status: "running", IsRunning: true})
+		}
+		return httpmock.NewJsonResponse(200, map[string]any{"data": tasks})
+	})
+
+	_, err := client.DeleteVM(context.Background(), "test", 320, "machine-uid", upload)
+	require.ErrorIs(t, err, capmox.ErrCloudInitUploadPending)
+	require.NotErrorIs(t, err, ErrVMIDFree)
+
+	active = false
+	_, err = client.DeleteVM(context.Background(), "test", 320, "machine-uid", upload)
+	require.ErrorIs(t, err, ErrVMIDFree, "quiescent intent with exact artifact absence may release VM ownership")
+}
+
 func TestDeleteVMPresentWaitsForRecordedUploadThenCleansBeforeDeletion(t *testing.T) {
 	client := newTestClient(t)
 	uploadUPID := "UPID:test:000D6BDA:041E0A54:654A5A1D:imgcopy:local:root@pam:"

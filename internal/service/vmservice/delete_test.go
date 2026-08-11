@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -88,6 +89,37 @@ func TestDeleteVMPreservesFinalizerUntilRecordedUploadIsReconciled(t *testing.T)
 	pendingErr := errors.New("recorded cloud-init upload task is not terminal")
 	proxmoxClient.EXPECT().DeleteVM(context.TODO(), "node1", int64(123), string(machineScope.ProxmoxMachine.UID), &upload).Return(nil, pendingErr).Once()
 	require.ErrorIs(t, DeleteVM(context.TODO(), machineScope), pendingErr)
+	require.NotEmpty(t, machineScope.ProxmoxMachine.Finalizers)
+
+	proxmoxClient.EXPECT().DeleteVM(context.TODO(), "node1", int64(123), string(machineScope.ProxmoxMachine.UID), &upload).Return(nil, goproxmox.ErrVMIDFree).Once()
+	require.NoError(t, DeleteVM(context.TODO(), machineScope))
+	require.Empty(t, machineScope.ProxmoxMachine.Finalizers)
+}
+
+func TestDeleteVMPreservesFinalizerForIntentUntilUploadQuiescence(t *testing.T) {
+	machineScope, proxmoxClient, _ := setupReconcilerTest(t)
+	vm := newRunningVM()
+	machineScope.ProxmoxMachine.Spec.VirtualMachineID = new(int64(vm.VMID))
+	machineScope.InfraCluster.ProxmoxCluster.AddNodeLocation(infrav1.NodeLocation{
+		Machine: corev1.LocalObjectReference{Name: machineScope.Name()},
+		Node:    "node1",
+	}, false)
+	upload := capmox.CloudInitUpload{
+		Version: 1,
+		Node:    "node1",
+		Storage: "local",
+		VolID:   "local:iso/user-data-" + string(machineScope.ProxmoxMachine.UID) + "-" + strings.Repeat("b", 64) + ".iso",
+		Size:    4096,
+		Attempt: 2,
+		Phase:   capmox.CloudInitUploadPhaseIntent,
+	}
+	encoded, err := json.Marshal(upload)
+	require.NoError(t, err)
+	machineScope.ProxmoxMachine.Annotations = map[string]string{cloudInitUploadAnnotation: string(encoded)}
+
+	pendingErr := fmt.Errorf("%w: active imgcopy task", capmox.ErrCloudInitUploadPending)
+	proxmoxClient.EXPECT().DeleteVM(context.TODO(), "node1", int64(123), string(machineScope.ProxmoxMachine.UID), &upload).Return(nil, pendingErr).Once()
+	require.ErrorIs(t, DeleteVM(context.TODO(), machineScope), capmox.ErrCloudInitUploadPending)
 	require.NotEmpty(t, machineScope.ProxmoxMachine.Finalizers)
 
 	proxmoxClient.EXPECT().DeleteVM(context.TODO(), "node1", int64(123), string(machineScope.ProxmoxMachine.UID), &upload).Return(nil, goproxmox.ErrVMIDFree).Once()

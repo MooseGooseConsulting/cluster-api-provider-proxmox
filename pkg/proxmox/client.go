@@ -40,6 +40,7 @@ type CloudInitUpload struct {
 	Storage string `json:"storage"`
 	VolID   string `json:"volID"`
 	Size    uint64 `json:"size"`
+	Attempt uint64 `json:"attempt,omitempty"`
 	UPID    string `json:"upid,omitempty"`
 	Phase   string `json:"phase"`
 }
