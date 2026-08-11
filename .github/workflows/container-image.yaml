@@ -31,7 +31,6 @@ jobs:
         with:
           images: ghcr.io/${{ env.REPO }}
           tags: |
-            type=sha,prefix=sha-,format=long
             type=ref,event=branch
             type=ref,event=tag
 
@@ -67,7 +66,6 @@ jobs:
         with:
           images: ghcr.io/${{ env.REPO }}
           tags: |
-            type=sha,prefix=sha-,format=long
             type=ref,event=branch
             type=ref,event=tag
 
