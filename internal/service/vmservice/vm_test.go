@@ -534,6 +534,8 @@ func TestReconcileDisks_ResizeDisk(t *testing.T) {
 
 func TestReconcileMachineAddresses_IPv4(t *testing.T) {
 	machineScope, _, _ := setupReconcilerTestWithCondition(t, infrav1.ProxmoxMachineVirtualMachineProvisionedWaitingForClusterAPIMachineAddressesReason)
+	machineScope.Machine.Name = "capi-machine-name"
+	machineScope.ProxmoxMachine.Name = "proxmox-machine-name"
 	vm := newRunningVM()
 	machineScope.SetVirtualMachine(vm)
 	machineScope.SetVirtualMachineID(int64(vm.VMID))
@@ -547,7 +549,7 @@ func TestReconcileMachineAddresses_IPv4(t *testing.T) {
 	machineScope.ProxmoxMachine.Status.BootstrapDataProvided = new(true)
 
 	require.NoError(t, reconcileMachineAddresses(machineScope))
-	require.Equal(t, machineScope.ProxmoxMachine.Status.Addresses[0].Address, machineScope.ProxmoxMachine.GetName())
+	require.Equal(t, machineScope.Machine.GetName(), machineScope.ProxmoxMachine.Status.Addresses[0].Address)
 	require.Equal(t, machineScope.ProxmoxMachine.Status.Addresses[1].Address, "10.10.10.10")
 }
 

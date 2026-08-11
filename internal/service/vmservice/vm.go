@@ -397,7 +397,7 @@ func getClusterAPIMachineAddresses(scope *scope.MachineScope) ([]clusterv1.Machi
 	addresses := []clusterv1.MachineAddress{
 		{
 			Type:    clusterv1.MachineHostName,
-			Address: scope.Name(),
+			Address: scope.Machine.GetName(),
 		},
 	}
 
