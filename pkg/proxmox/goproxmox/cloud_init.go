@@ -151,6 +151,9 @@ func (c *APIClient) CloudInit(ctx context.Context, vm *proxmox.VirtualMachine, m
 	if err != nil {
 		return err
 	}
+	if err := c.reconcileLegacyCloudInitMount(ctx, vm, machineIdentity, device); err != nil {
+		return err
+	}
 	if err := validateCloudInitTargetDevice(vm, machineIdentity, device); err != nil {
 		return err
 	}
@@ -243,10 +246,13 @@ func (c *APIClient) CloudInit(ctx context.Context, vm *proxmox.VirtualMachine, m
 	if err := recordCloudInitUpload(recorder, uploadState, "record completed cloud-init upload"); err != nil {
 		return err
 	}
+	return finishCloudInitMount(ctx, vm, machineIdentity, device, expectedVolID)
+}
+
+func finishCloudInitMount(ctx context.Context, vm *proxmox.VirtualMachine, machineIdentity, device, expectedVolID string) error {
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("%w: exact cloud-init upload is complete; defer mount after reconciliation cancellation: %w", capmox.ErrCloudInitUploadPending, err)
 	}
-
 	if err := mountCloudInitISO(ctx, vm, machineIdentity, device, expectedVolID); err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return fmt.Errorf("%w: cloud-init mount outcome requires successor reconciliation: %w", capmox.ErrCloudInitUploadPending, ctxErr)
@@ -291,8 +297,8 @@ func (c *APIClient) resumeCloudInitUpload(ctx context.Context, node *proxmox.Nod
 	expectedVolID := current.Storage + ":iso/" + isoName
 	exact := current.VolID == expectedVolID && current.Size == size
 	if !exact {
-		if err := c.reconcileRecordedCloudInitUpload(ctx, node, machineIdentity, current); err != nil {
-			return true, false, fmt.Errorf("%w: reconcile superseded durable upload: %v", capmox.ErrCloudInitUploadPending, err)
+		if err := c.reconcileMismatchedCloudInitUpload(ctx, node, vm, machineIdentity, device, expectedVolID, current); err != nil {
+			return true, false, err
 		}
 		return false, false, nil
 	}
@@ -310,19 +316,8 @@ func (c *APIClient) resumeCloudInitUpload(ctx context.Context, node *proxmox.Nod
 			return false, true, nil
 		}
 	case capmox.CloudInitUploadPhaseAccepted:
-		if current.UPID == "" {
-			return true, false, errors.New("accepted durable cloud-init upload has no task UPID")
-		}
-		task, taskErr := c.GetTask(ctx, current.UPID)
-		if taskErr != nil {
-			return true, false, fmt.Errorf("%w: get accepted upload task %q: %v", capmox.ErrCloudInitUploadPending, current.UPID, taskErr)
-		}
-		waitErr := waitForCloudInitTask(ctx, task, 2)
-		if task.IsFailed || (task.ExitStatus != "" && task.ExitStatus != "OK") {
-			return true, false, fmt.Errorf("accepted cloud-init upload task failed with exit status %q", task.ExitStatus)
-		}
-		if proofErr := requireCloudInitISO(ctx, storage, current.Storage, isoName, size); proofErr != nil {
-			return true, false, fmt.Errorf("%w: accepted upload is not yet proven (wait=%v proof=%v)", capmox.ErrCloudInitUploadPending, waitErr, proofErr)
+		if err := c.resumeAcceptedCloudInitUpload(ctx, node, storage, isoName, size, current); err != nil {
+			return true, false, err
 		}
 	case capmox.CloudInitUploadPhaseComplete:
 		if err := requireCloudInitISO(ctx, storage, current.Storage, isoName, size); err != nil {
@@ -345,6 +340,84 @@ func (c *APIClient) resumeCloudInitUpload(ctx context.Context, node *proxmox.Nod
 		return true, false, err
 	}
 	return true, false, nil
+}
+
+func (c *APIClient) reconcileLegacyCloudInitMount(ctx context.Context, vm *proxmox.VirtualMachine, machineIdentity, device string) error {
+	if vm.VirtualMachineConfig == nil || !vm.HasTag(proxmox.MakeTag(proxmox.TagCloudInit)) {
+		return nil
+	}
+	if !isLegacyCloudInitVolume(cloudInitDeviceValue(vm, device), vm.VMID) {
+		return nil
+	}
+	if err := c.UnmountCloudInitISO(ctx, vm, machineIdentity, device); err != nil {
+		return fmt.Errorf("reconcile legacy cloud-init artifact before content-addressed upload: %w", err)
+	}
+	return nil
+}
+
+func isLegacyCloudInitVolume(deviceValue string, vmID proxmox.StringOrUint64) bool {
+	_, _, err := legacyCloudInitVolume(deviceValue, vmID)
+	return err == nil
+}
+
+func (c *APIClient) reconcileMismatchedCloudInitUpload(ctx context.Context, node *proxmox.Node, vm *proxmox.VirtualMachine, machineIdentity, device, expectedVolID string, current *capmox.CloudInitUpload) error {
+	if current.Phase != capmox.CloudInitUploadPhaseComplete {
+		if err := c.reconcileRecordedCloudInitUpload(ctx, node, machineIdentity, current); err != nil {
+			return fmt.Errorf("%w: reconcile superseded durable upload: %v", capmox.ErrCloudInitUploadPending, err)
+		}
+		return nil
+	}
+	if err := validateRecordedCloudInitUpload(node, machineIdentity, current); err != nil {
+		return fmt.Errorf("invalid superseded durable upload: %w", err)
+	}
+	storage, err := node.Storage(ctx, current.Storage)
+	if err != nil {
+		return fmt.Errorf("%w: get superseded recorded storage %q: %v", capmox.ErrCloudInitUploadPending, current.Storage, err)
+	}
+	if err := c.reconcileSupersededCloudInitArtifact(ctx, vm, machineIdentity, device, expectedVolID, storage, current.VolID); err != nil {
+		return fmt.Errorf("%w: reconcile mounted superseded durable upload: %v", capmox.ErrCloudInitUploadPending, err)
+	}
+	return nil
+}
+
+func (c *APIClient) resumeAcceptedCloudInitUpload(ctx context.Context, node *proxmox.Node, storage cloudInitStorage, isoName string, size uint64, current *capmox.CloudInitUpload) error {
+	if current.UPID == "" {
+		return errors.New("accepted durable cloud-init upload has no task UPID")
+	}
+	task, taskErr := c.GetTask(ctx, current.UPID)
+	if taskErr != nil {
+		return resumeAcceptedCloudInitWithoutTask(ctx, node, storage, isoName, size, current, taskErr.Error())
+	}
+	waitErr := waitForCloudInitTask(ctx, task, 2)
+	if task.IsFailed || (task.ExitStatus != "" && task.ExitStatus != "OK") {
+		return fmt.Errorf("accepted cloud-init upload task failed with exit status %q", task.ExitStatus)
+	}
+	if proofErr := requireCloudInitISO(ctx, storage, current.Storage, isoName, size); proofErr != nil {
+		return fmt.Errorf("%w: accepted upload is not yet proven (wait=%v proof=%v)", capmox.ErrCloudInitUploadPending, waitErr, proofErr)
+	}
+	return nil
+}
+
+func resumeAcceptedCloudInitWithoutTask(ctx context.Context, node *proxmox.Node, storage cloudInitStorage, isoName string, size uint64, current *capmox.CloudInitUpload, taskError string) error {
+	present, proofErr := proveCloudInitUploadWithoutTask(ctx, node, storage, current.Storage, isoName, size)
+	if proofErr != nil {
+		return fmt.Errorf("%w: accepted upload task %q is unavailable (%s) and exact recovery proof failed: %v", capmox.ErrCloudInitUploadPending, current.UPID, taskError, proofErr)
+	}
+	if !present {
+		return fmt.Errorf("accepted cloud-init upload task %q is unavailable and its exact artifact is absent after upload quiescence: %s", current.UPID, taskError)
+	}
+	return nil
+}
+
+func proveCloudInitUploadWithoutTask(ctx context.Context, node *proxmox.Node, storage cloudInitStorage, storageName, isoName string, size uint64) (bool, error) {
+	present, err := inspectCloudInitISO(ctx, storage, storageName, isoName, size)
+	if err != nil {
+		return false, fmt.Errorf("inspect exact upload artifact: %w", err)
+	}
+	if err := requireCloudInitUploadQuiescence(ctx, node); err != nil {
+		return false, err
+	}
+	return present, nil
 }
 
 func (c *APIClient) resumeUnacknowledgedCloudInitUpload(ctx context.Context, node *proxmox.Node, storage cloudInitStorage, isoName string, size uint64, current *capmox.CloudInitUpload, recorder capmox.CloudInitUploadRecorder) (bool, error) {
@@ -683,11 +756,7 @@ func uploadCloudInitISO(ctx context.Context, storage cloudInitUploadStorage, sto
 		return nil, false, err
 	}
 
-	proofCtx := ctx
-	cancel := func() {}
-	if ctx.Err() != nil {
-		proofCtx, cancel = context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
-	}
+	proofCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 	defer cancel()
 	present, proofErr := inspectCloudInitISO(proofCtx, storage, storageName, isoName, size)
 	if proofErr != nil {
@@ -812,10 +881,10 @@ func requireCloudInitMount(ctx context.Context, vm *proxmox.VirtualMachine, mach
 	return nil
 }
 
-func ownedCloudInitVolume(deviceValue, machineIdentity string) (storageName, volID string, err error) {
+func parseCloudInitISOMount(deviceValue string) (storageName, volID, name string, err error) {
 	parts := strings.Split(deviceValue, ",")
 	if len(parts) < 2 {
-		return "", "", fmt.Errorf("cloud-init device is not an exact ISO mount")
+		return "", "", "", fmt.Errorf("cloud-init device is not an exact ISO mount")
 	}
 	seenMedia := false
 	seenSize := false
@@ -823,29 +892,36 @@ func ownedCloudInitVolume(deviceValue, machineIdentity string) (storageName, vol
 		switch {
 		case option == "media=cdrom":
 			if seenMedia {
-				return "", "", fmt.Errorf("cloud-init device has duplicate media option")
+				return "", "", "", fmt.Errorf("cloud-init device has duplicate media option")
 			}
 			seenMedia = true
 		case strings.HasPrefix(option, "media="):
-			return "", "", fmt.Errorf("cloud-init device has conflicting media option")
+			return "", "", "", fmt.Errorf("cloud-init device has conflicting media option")
 		case strings.HasPrefix(option, "size="):
 			if seenSize || !isNormalizedPVESize(strings.TrimPrefix(option, "size=")) {
-				return "", "", fmt.Errorf("cloud-init device has invalid normalized size option")
+				return "", "", "", fmt.Errorf("cloud-init device has invalid normalized size option")
 			}
 			seenSize = true
 		default:
-			return "", "", fmt.Errorf("cloud-init device has unsupported normalized option %q", option)
+			return "", "", "", fmt.Errorf("cloud-init device has unsupported normalized option %q", option)
 		}
 	}
 	if !seenMedia {
-		return "", "", fmt.Errorf("cloud-init device is missing media=cdrom")
+		return "", "", "", fmt.Errorf("cloud-init device is missing media=cdrom")
 	}
 	storageAndName := strings.Split(parts[0], ":iso/")
 	if len(storageAndName) != 2 || !isSafePVEStorageName(storageAndName[0]) {
-		return "", "", fmt.Errorf("cloud-init device has invalid storage volume identity")
+		return "", "", "", fmt.Errorf("cloud-init device has invalid storage volume identity")
+	}
+	return storageAndName[0], parts[0], storageAndName[1], nil
+}
+
+func ownedCloudInitVolume(deviceValue, machineIdentity string) (storageName, volID string, err error) {
+	storageName, volID, name, err := parseCloudInitISOMount(deviceValue)
+	if err != nil {
+		return "", "", err
 	}
 	prefix := cloudInitStorageFilenamePrefix + machineIdentity + "-"
-	name := storageAndName[1]
 	if !strings.HasPrefix(name, prefix) || !strings.HasSuffix(name, ".iso") {
 		return "", "", fmt.Errorf("cloud-init device is not owned by Machine %q", machineIdentity)
 	}
@@ -854,7 +930,19 @@ func ownedCloudInitVolume(deviceValue, machineIdentity string) (storageName, vol
 	if nameErr != nil || expectedName != name {
 		return "", "", fmt.Errorf("cloud-init device has invalid content-addressed filename")
 	}
-	return storageAndName[0], parts[0], nil
+	return storageName, volID, nil
+}
+
+func legacyCloudInitVolume(deviceValue string, vmID proxmox.StringOrUint64) (storageName, volID string, err error) {
+	storageName, volID, name, err := parseCloudInitISOMount(deviceValue)
+	if err != nil {
+		return "", "", err
+	}
+	expectedName := fmt.Sprintf(proxmox.UserDataISOFormat, vmID)
+	if name != expectedName {
+		return "", "", fmt.Errorf("cloud-init device is not the exact legacy VMID artifact %q", expectedName)
+	}
+	return storageName, volID, nil
 }
 
 func isNormalizedPVESize(value string) bool {

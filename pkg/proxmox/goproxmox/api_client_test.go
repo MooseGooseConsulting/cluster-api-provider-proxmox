@@ -711,6 +711,7 @@ func TestDeleteVMWaitsForRecordedUploadThenCleansLateArtifact(t *testing.T) {
 	}
 
 	uploadRunning := true
+	taskHistoryExpired := false
 	artifactPresent := false
 	deleteCalls := 0
 	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/test/status$`,
@@ -720,6 +721,9 @@ func TestDeleteVMWaitsForRecordedUploadThenCleansLateArtifact(t *testing.T) {
 	httpmock.RegisterResponder(http.MethodGet, `=~/cluster/nextid$`,
 		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": "320"}))
 	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/test/tasks/`+uploadUPID+`/status$`, func(*http.Request) (*http.Response, error) {
+		if taskHistoryExpired {
+			return httpmock.NewStringResponse(500, "no such task"), nil
+		}
 		task := proxmox.Task{UPID: proxmox.UPID(uploadUPID), Node: "test", Status: "running", IsRunning: true}
 		if !uploadRunning {
 			task.Status = "stopped"
@@ -739,6 +743,8 @@ func TestDeleteVMWaitsForRecordedUploadThenCleansLateArtifact(t *testing.T) {
 		}
 		return httpmock.NewJsonResponse(200, map[string]any{"data": contents})
 	})
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/test/tasks\?limit=1&source=active&typefilter=imgcopy$`,
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": []*proxmox.Task{}}))
 	httpmock.RegisterResponder(http.MethodDelete, `=~/nodes/test/storage/local/content/.*$`, func(*http.Request) (*http.Response, error) {
 		deleteCalls++
 		artifactPresent = false
@@ -764,6 +770,7 @@ func TestDeleteVMWaitsForRecordedUploadThenCleansLateArtifact(t *testing.T) {
 	// Simulate the controller having crashed after upload dispatch, the VM being
 	// removed independently, and the accepted task materializing its ISO later.
 	uploadRunning = false
+	taskHistoryExpired = true
 	artifactPresent = true
 	_, err = client.DeleteVM(context.Background(), "test", 320, "machine-uid", upload)
 	require.ErrorIs(t, err, ErrVMIDFree)

@@ -408,7 +408,15 @@ func (c *APIClient) waitForRecordedCloudInitUpload(ctx context.Context, node *pr
 	if upload.UPID != "" && upload.Phase != capmox.CloudInitUploadPhaseComplete {
 		task, err := c.GetTask(ctx, upload.UPID)
 		if err != nil {
-			return fmt.Errorf("get recorded cloud-init upload task %q: %w", upload.UPID, err)
+			storage, storageErr := node.Storage(ctx, upload.Storage)
+			if storageErr != nil {
+				return fmt.Errorf("%w: get recorded storage after upload task %q became unavailable: %v", capmox.ErrCloudInitUploadPending, upload.UPID, storageErr)
+			}
+			isoName := strings.TrimPrefix(upload.VolID, upload.Storage+":iso/")
+			if _, proofErr := proveCloudInitUploadWithoutTask(ctx, node, storage, upload.Storage, isoName, upload.Size); proofErr != nil {
+				return fmt.Errorf("%w: recorded upload task %q is unavailable (%v) and cleanup proof failed: %v", capmox.ErrCloudInitUploadPending, upload.UPID, err, proofErr)
+			}
+			return nil
 		}
 		waitErr := waitForCloudInitTask(ctx, task, 2)
 		taskFailed := task.IsFailed || (task.ExitStatus != "" && task.ExitStatus != "OK")
@@ -533,13 +541,19 @@ func (c *APIClient) UnmountCloudInitISO(ctx context.Context, vm *proxmox.Virtual
 	} else {
 		storageName, mountedVolID, proofErr := ownedCloudInitVolume(deviceValue, machineIdentity)
 		if proofErr != nil {
-			// A foreign target device is outside CAPMOX authority. Preserve it, but
-			// still recover and delete the sole unattached Machine-owned artifact.
-			storage, volID, err = recoverOwnedCloudInitVolume(ctx, node, machineIdentity)
-			if err != nil {
-				return fmt.Errorf("recover unattached cloud-init artifact while preserving foreign device: %w", err)
+			legacyStorageName, legacyVolID, legacyErr := legacyCloudInitVolume(deviceValue, vm.VMID)
+			if legacyErr == nil {
+				storageName, mountedVolID, proofErr = legacyStorageName, legacyVolID, nil
+			} else {
+				// A foreign target device is outside CAPMOX authority. Preserve it, but
+				// still recover and delete the sole unattached Machine-owned artifact.
+				storage, volID, err = recoverOwnedCloudInitVolume(ctx, node, machineIdentity)
+				if err != nil {
+					return fmt.Errorf("recover unattached cloud-init artifact while preserving foreign device: %w", err)
+				}
 			}
-		} else {
+		}
+		if proofErr == nil {
 			storage, err = node.Storage(ctx, storageName)
 			if err != nil {
 				return fmt.Errorf("get cloud-init storage %q: %w", storageName, err)
