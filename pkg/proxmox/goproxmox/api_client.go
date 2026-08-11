@@ -231,6 +231,15 @@ func (c *APIClient) DeleteVM(ctx context.Context, nodeName string, vmID int64, m
 	}
 
 	if vmidFree, err := cluster.CheckID(ctx, int(vmID)); vmidFree {
+		storage, volID, cleanupErr := recoverOwnedCloudInitVolume(ctx, node, machineIdentity)
+		if cleanupErr != nil {
+			return nil, fmt.Errorf("cannot recover untagged cloud-init ISO for absent vm id %d: %w", vmID, cleanupErr)
+		}
+		if storage != nil {
+			if _, cleanupErr := deleteOwnedCloudInitVolume(ctx, storage, volID); cleanupErr != nil {
+				return nil, fmt.Errorf("cannot delete untagged cloud-init ISO for absent vm id %d: %w", vmID, cleanupErr)
+			}
+		}
 		return nil, ErrVMIDFree
 	} else if err != nil {
 		return nil, err
@@ -450,7 +459,7 @@ func recoverOwnedCloudInitVolume(ctx context.Context, node *proxmox.Node, machin
 }
 
 func storageSupportsContent(configured, expected string) bool {
-	for _, content := range strings.Split(configured, ",") {
+	for content := range strings.SplitSeq(configured, ",") {
 		if content == expected {
 			return true
 		}

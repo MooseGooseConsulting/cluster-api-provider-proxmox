@@ -538,17 +538,24 @@ func TestProxmoxAPIClient_FindVMTemplateByTags(t *testing.T) {
 
 func TestProxmoxAPIClient_DeleteVM(t *testing.T) {
 	tests := []struct {
-		name  string
-		node  string
-		vmID  int64
-		fails bool
-		err   string
+		name               string
+		node               string
+		vmID               int64
+		vmFree             bool
+		contentPresent     bool
+		wantStorageDeletes int
+		fails              bool
+		err                string
 	}{
-		{name: "delete", node: "test", vmID: 101, fails: false, err: ""},
+		{name: "delete", node: "test", vmID: 101, contentPresent: true, wantStorageDeletes: 1},
 		{name: "node not found", node: "enoent", vmID: 101, fails: true,
 			err: "cannot find node with name enoent: 500 Internal Server Error"},
-		{name: "delete fails", node: "test", vmID: 102, fails: true,
+		{name: "delete fails", node: "test", vmID: 102, contentPresent: true, wantStorageDeletes: 1, fails: true,
 			err: "cannot delete vm with id 102: not authorized to access endpoint"},
+		{name: "absent vm removes exact immutable artifact", node: "test", vmID: 103, vmFree: true,
+			contentPresent: true, wantStorageDeletes: 1, fails: true, err: ErrVMIDFree.Error()},
+		{name: "absent vm with absent artifact is replay safe", node: "test", vmID: 104, vmFree: true,
+			contentPresent: false, wantStorageDeletes: 0, fails: true, err: ErrVMIDFree.Error()},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -558,11 +565,15 @@ func TestProxmoxAPIClient_DeleteVM(t *testing.T) {
 			upid := "UPID:test:000D6BDA:041E0A54:654A5A1D:qmdestroy:101:root@pam:"
 			logicalDigest := cloudInitBootstrapDigest("delete-before-ready", "metadata", "", "network")
 			volID := "local:iso/user-data-machine-uid-" + logicalDigest + ".iso"
-			contentPresent := true
+			contentPresent := test.contentPresent
 			storageDeleteCalls := 0
 
-			httpmock.RegisterResponder(http.MethodGet, `=~/cluster/nextid`,
-				newJSONResponder(400, fmt.Sprintf("VM %d already exists", test.vmID)))
+			if test.vmFree {
+				httpmock.RegisterResponder(http.MethodGet, `=~/cluster/nextid`, newJSONResponder(200, fmt.Sprintf("%d", test.vmID)))
+			} else {
+				httpmock.RegisterResponder(http.MethodGet, `=~/cluster/nextid`,
+					newJSONResponder(400, fmt.Sprintf("VM %d already exists", test.vmID)))
+			}
 			httpmock.RegisterResponder(http.MethodGet, `=~/nodes/test/status`,
 				httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": proxmox.Node{Name: "test"}}))
 			httpmock.RegisterResponder(http.MethodGet, `=~/nodes/enoent/status`,
@@ -613,9 +624,9 @@ func TestProxmoxAPIClient_DeleteVM(t *testing.T) {
 				require.NoError(t, err)
 				require.Equal(t, "qmdestroy", task.Type)
 				require.Equal(t, "root@pam", task.User)
-				require.Equal(t, 1, storageDeleteCalls, "deletion before readiness must remove the exact immutable Machine ISO")
-				require.False(t, contentPresent)
 			}
+			require.Equal(t, test.wantStorageDeletes, storageDeleteCalls, "deletion must remove only the exact immutable Machine ISO")
+			require.False(t, contentPresent)
 		})
 	}
 }
