@@ -941,6 +941,38 @@ func TestCloudInitRecoversAcceptedUploadAfterTaskHistoryExpires(t *testing.T) {
 	require.Zero(t, httpmock.GetCallCountInfo()["POST =~/nodes/pve/storage/local/upload$"])
 }
 
+func TestCloudInitCompletedReplayRetriesOnlyStorageInventoryFailure(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		contentCode int
+		contents    []*proxmox.StorageContent
+		wantPending bool
+	}{
+		{name: "inventory unavailable is retryable", contentCode: 500, wantPending: true},
+		{name: "exact artifact absent is terminal", contentCode: 200},
+		{name: "exact artifact metadata mismatch is terminal", contentCode: 200, contents: []*proxmox.StorageContent{{Volid: "local:iso/user-data-machine-uid-" + strings.Repeat("a", cloudInitDigestLength) + ".iso", Format: "raw", Size: 4096}}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			client := newTestClient(t)
+			isoName := "user-data-machine-uid-" + strings.Repeat("a", cloudInitDigestLength) + ".iso"
+			current := &capmox.CloudInitUpload{Version: 1, Node: "pve", Storage: "local", VolID: "local:iso/" + isoName, Size: 4096, Phase: capmox.CloudInitUploadPhaseComplete}
+			node := (&proxmox.Node{}).New(client.Client, "pve")
+			httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve/storage/local/status$`,
+				httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": proxmox.Storage{Name: "local", Content: "iso", Enabled: 1}}))
+			httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve/storage/local/content$`,
+				httpmock.NewJsonResponderOrPanic(test.contentCode, map[string]any{"data": test.contents}))
+			vm := &proxmox.VirtualMachine{Node: "pve", VMID: 320, VirtualMachineConfig: &proxmox.VirtualMachineConfig{IDE0: cloudInitUnmountedDeviceValue}}
+			vm.New(client.Client, "pve", 320)
+
+			handled, rearmed, err := client.resumeCloudInitUpload(context.Background(), node, vm, "machine-uid", cloudInitDevice, isoName, current.Size, current, func(capmox.CloudInitUpload) error { return nil })
+			require.Error(t, err)
+			require.True(t, handled)
+			require.False(t, rearmed)
+			require.Equal(t, test.wantPending, errors.Is(err, capmox.ErrCloudInitUploadPending))
+		})
+	}
+}
+
 func TestCloudInitCancellationDefersRecoveryAndMountToSuccessor(t *testing.T) {
 	for _, test := range []struct {
 		name               string

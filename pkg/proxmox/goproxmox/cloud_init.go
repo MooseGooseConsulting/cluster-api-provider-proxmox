@@ -51,6 +51,8 @@ const (
 	cloudInitDispatchLease         = 2 * time.Minute
 )
 
+var errCloudInitStorageInventoryUnavailable = errors.New("cloud-init storage inventory unavailable")
+
 var waitForCloudInitTask = func(ctx context.Context, task *proxmox.Task, attempts int) error {
 	return task.WaitFor(ctx, attempts)
 }
@@ -320,8 +322,15 @@ func (c *APIClient) resumeCloudInitUpload(ctx context.Context, node *proxmox.Nod
 			return true, false, err
 		}
 	case capmox.CloudInitUploadPhaseComplete:
-		if err := requireCloudInitISO(ctx, storage, current.Storage, isoName, size); err != nil {
-			return true, false, fmt.Errorf("completed durable upload lost exact artifact proof: %w", err)
+		present, proofErr := inspectCloudInitISO(ctx, storage, current.Storage, isoName, size)
+		if proofErr != nil {
+			if errors.Is(proofErr, errCloudInitStorageInventoryUnavailable) {
+				return true, false, fmt.Errorf("%w: completed durable upload storage proof is temporarily unavailable: %v", capmox.ErrCloudInitUploadPending, proofErr)
+			}
+			return true, false, fmt.Errorf("completed durable upload lost exact artifact proof: %w", proofErr)
+		}
+		if !present {
+			return true, false, fmt.Errorf("completed durable upload lost exact artifact proof: exact volume %q is absent", current.VolID)
 		}
 	default:
 		return true, false, fmt.Errorf("invalid durable cloud-init upload phase %q", current.Phase)
@@ -797,7 +806,7 @@ func requireCloudInitISO(ctx context.Context, storage cloudInitStorage, storageN
 func inspectCloudInitISO(ctx context.Context, storage cloudInitStorage, storageName, isoName string, size uint64) (bool, error) {
 	contents, err := storage.GetContent(ctx)
 	if err != nil {
-		return false, err
+		return false, fmt.Errorf("%w: %w", errCloudInitStorageInventoryUnavailable, err)
 	}
 	expectedVolID := fmt.Sprintf("%s:iso/%s", storageName, isoName)
 	var matched *proxmox.StorageContent
