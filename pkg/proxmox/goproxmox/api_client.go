@@ -21,9 +21,11 @@ import (
 	"context"
 	"fmt"
 	"maps"
+	"net/http"
 	"net/url"
 	"slices"
 	"strings"
+	"sync"
 
 	"github.com/go-logr/logr"
 	"github.com/luthermonson/go-proxmox"
@@ -42,17 +44,61 @@ var ErrVMIDFree = errors.New("VMID is free")
 // APIClient Proxmox API client object.
 type APIClient struct {
 	*proxmox.Client
-	logger logr.Logger
+	logger          logr.Logger
+	uploadTransport *uploadContextTransport
+}
+
+type uploadContextTransport struct {
+	base    http.RoundTripper
+	serial  sync.Mutex
+	mu      sync.RWMutex
+	context context.Context
+}
+
+func (t *uploadContextTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	if strings.HasSuffix(request.URL.Path, "/upload") {
+		t.mu.RLock()
+		ctx := t.context
+		t.mu.RUnlock()
+		if ctx != nil {
+			request = request.Clone(ctx)
+		}
+	}
+	return t.base.RoundTrip(request)
+}
+
+func (t *uploadContextTransport) withContext(ctx context.Context, dispatch func() (*proxmox.Task, error)) (*proxmox.Task, error) {
+	t.serial.Lock()
+	defer t.serial.Unlock()
+	t.mu.Lock()
+	t.context = ctx
+	t.mu.Unlock()
+	defer func() {
+		t.mu.Lock()
+		t.context = nil
+		t.mu.Unlock()
+	}()
+	return dispatch()
 }
 
 // NewAPIClient initializes a Proxmox API client. If the client is misconfigured, an error is returned.
-func NewAPIClient(ctx context.Context, logger logr.Logger, baseURL string, options ...proxmox.Option) (*APIClient, error) {
+func NewAPIClient(ctx context.Context, logger logr.Logger, baseURL string, httpClient *http.Client, options ...proxmox.Option) (*APIClient, error) {
 	proxmoxAPIURL, err := url.JoinPath(baseURL, "api2", "json")
 	if err != nil {
 		return nil, fmt.Errorf("invalid proxmox base URL %q: %w", baseURL, err)
 	}
 
-	options = append(options, proxmox.WithLogger(capmox.Logger{}))
+	if httpClient == nil {
+		httpClient = http.DefaultClient
+	}
+	baseTransport := httpClient.Transport
+	if baseTransport == nil {
+		baseTransport = http.DefaultTransport
+	}
+	uploadTransport := &uploadContextTransport{base: baseTransport}
+	contextClient := *httpClient
+	contextClient.Transport = uploadTransport
+	options = append(options, proxmox.WithHTTPClient(&contextClient), proxmox.WithLogger(capmox.Logger{}))
 	upstreamClient := proxmox.NewClient(proxmoxAPIURL, options...)
 	version, err := upstreamClient.Version(ctx)
 	if err != nil {
@@ -62,8 +108,9 @@ func NewAPIClient(ctx context.Context, logger logr.Logger, baseURL string, optio
 	logger.Info("Proxmox server", "version", version.Release)
 
 	return &APIClient{
-		Client: upstreamClient,
-		logger: logger,
+		Client:          upstreamClient,
+		logger:          logger,
+		uploadTransport: uploadTransport,
 	}, nil
 }
 
@@ -219,12 +266,19 @@ func (c *APIClient) DeleteVM(ctx context.Context, nodeName string, vmID int64, m
 	if vmID < 100 {
 		return nil, fmt.Errorf("%w: vm id %d is below the minimum", ErrVMIDFree, vmID)
 	}
-	unlockDispatch := acquireCloudInitDispatch(nodeName + "/" + machineIdentity)
+	unlockDispatch := acquireCloudInitDispatch(machineIdentity)
 	defer unlockDispatch()
 
 	node := (&proxmox.Node{}).New(c.Client, nodeName)
 	if err := node.Status(ctx); err != nil {
 		return nil, fmt.Errorf("cannot find node with name %s: %w", nodeName, err)
+	}
+	recordedNode := node
+	if upload != nil && upload.Node != "" && upload.Node != nodeName {
+		recordedNode = (&proxmox.Node{}).New(c.Client, upload.Node)
+		if err := recordedNode.Status(ctx); err != nil {
+			return nil, fmt.Errorf("cannot find recorded cloud-init node with name %s: %w", upload.Node, err)
+		}
 	}
 
 	cluster, err := c.Cluster(ctx)
@@ -233,12 +287,12 @@ func (c *APIClient) DeleteVM(ctx context.Context, nodeName string, vmID int64, m
 	}
 
 	if upload != nil && upload.Phase != capmox.CloudInitUploadPhaseComplete {
-		if err := c.reconcileRecordedCloudInitUpload(ctx, node, machineIdentity, upload); err != nil {
+		if err := c.reconcileRecordedCloudInitUpload(ctx, recordedNode, machineIdentity, upload); err != nil {
 			return nil, fmt.Errorf("cannot reconcile recorded cloud-init upload before deleting vm id %d: %w", vmID, err)
 		}
 	}
 	if vmidFree, err := cluster.CheckID(ctx, int(vmID)); vmidFree {
-		if err := c.reconcileRecordedCloudInitUpload(ctx, node, machineIdentity, upload); err != nil {
+		if err := c.reconcileRecordedCloudInitUpload(ctx, recordedNode, machineIdentity, upload); err != nil {
 			return nil, fmt.Errorf("cannot reconcile recorded cloud-init upload for absent vm id %d: %w", vmID, err)
 		}
 		storage, volID, cleanupErr := recoverOwnedCloudInitVolume(ctx, node, machineIdentity)
@@ -516,7 +570,22 @@ func (c *APIClient) UnmountCloudInitISO(ctx context.Context, vm *proxmox.Virtual
 		return err
 	}
 	if err == nil {
-		return removeTagTask.WaitFor(ctx, 2)
+		waitErr := waitForCloudInitEffect(ctx, removeTagTask, 2, "cloud-init ownership tag removal", false, func() error {
+			if err := vm.Ping(ctx); err != nil {
+				return fmt.Errorf("refetch VM config: %w", err)
+			}
+			if vm.HasTag(proxmox.MakeTag(proxmox.TagCloudInit)) {
+				return errors.New("cloud-init ownership tag remains present")
+			}
+			return nil
+		})
+		if waitErr != nil {
+			if refreshErr := vm.Ping(ctx); refreshErr != nil {
+				return fmt.Errorf("%w; refetch VM config after failed ownership tag removal: %v", waitErr, refreshErr)
+			}
+			return waitErr
+		}
+		return nil
 	}
 	return nil
 }

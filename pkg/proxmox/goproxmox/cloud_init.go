@@ -95,9 +95,32 @@ func acquireCloudInitDispatch(machineIdentity string) func() {
 }
 
 type cloudInitStorage interface {
-	UploadWithHash(content, file string, storageFilename *string, checksum, checksumAlgorithm string) (*proxmox.Task, error)
 	GetContent(ctx context.Context) ([]*proxmox.StorageContent, error)
 	DeleteContent(ctx context.Context, content string) (*proxmox.Task, error)
+}
+
+type cloudInitUploadStorage interface {
+	cloudInitStorage
+	UploadWithHash(ctx context.Context, content, file string, storageFilename *string, checksum, checksumAlgorithm string) (*proxmox.Task, error)
+}
+
+type contextCloudInitStorage struct {
+	storage   *proxmox.Storage
+	transport *uploadContextTransport
+}
+
+func (s *contextCloudInitStorage) UploadWithHash(ctx context.Context, content, file string, storageFilename *string, checksum, checksumAlgorithm string) (*proxmox.Task, error) {
+	return s.transport.withContext(ctx, func() (*proxmox.Task, error) {
+		return s.storage.UploadWithHash(content, file, storageFilename, checksum, checksumAlgorithm)
+	})
+}
+
+func (s *contextCloudInitStorage) GetContent(ctx context.Context) ([]*proxmox.StorageContent, error) {
+	return s.storage.GetContent(ctx)
+}
+
+func (s *contextCloudInitStorage) DeleteContent(ctx context.Context, content string) (*proxmox.Task, error) {
+	return s.storage.DeleteContent(ctx, content)
 }
 
 // CloudInit uploads and mounts a cloud-init ISO. The storage filename binds
@@ -131,7 +154,7 @@ func (c *APIClient) CloudInit(ctx context.Context, vm *proxmox.VirtualMachine, m
 	if err := validateCloudInitTargetDevice(vm, machineIdentity, device); err != nil {
 		return err
 	}
-	unlockDispatch := acquireCloudInitDispatch(vm.Node + "/" + machineIdentity)
+	unlockDispatch := acquireCloudInitDispatch(machineIdentity)
 	defer unlockDispatch()
 	// The tag is the durable pre-mount ownership marker. Applying it before the
 	// upload lets deletion distinguish a clean, untagged VM from a failed
@@ -139,25 +162,12 @@ func (c *APIClient) CloudInit(ctx context.Context, vm *proxmox.VirtualMachine, m
 	if err := addCloudInitOwnershipTag(ctx, vm); err != nil {
 		return err
 	}
-	nextAttempt := uint64(1)
-	intentAlreadyRecorded := false
-	if current != nil {
-		handled, rearmed, err := c.resumeCloudInitUpload(ctx, node, vm, machineIdentity, device, isoName, size, current, recorder)
-		if err != nil {
-			return err
-		}
-		if handled {
-			return nil
-		}
-		if rearmed {
-			nextAttempt = current.Attempt
-			intentAlreadyRecorded = true
-		} else if current.Attempt > 0 {
-			if current.Attempt == ^uint64(0) {
-				return errors.New("cloud-init upload attempt generation overflow")
-			}
-			nextAttempt = current.Attempt + 1
-		}
+	nextAttempt, intentAlreadyRecorded, handled, err := c.prepareCloudInitAttempt(ctx, node, vm, machineIdentity, device, isoName, size, current, recorder)
+	if err != nil {
+		return err
+	}
+	if handled {
+		return nil
 	}
 
 	selection, err := findCloudInitUploadTarget(ctx, node, machineIdentity, isoName, size)
@@ -192,13 +202,13 @@ func (c *APIClient) CloudInit(ctx context.Context, vm *proxmox.VirtualMachine, m
 		}
 	}
 	if !intentAlreadyRecorded {
-		if err := recorder(uploadState); err != nil {
-			return fmt.Errorf("record cloud-init upload intent: %w", err)
+		if err := recordCloudInitUpload(recorder, uploadState, "record cloud-init upload intent"); err != nil {
+			return err
 		}
 	}
 	uploadState.Phase = capmox.CloudInitUploadPhaseDispatching
-	if err := recorder(uploadState); err != nil {
-		return fmt.Errorf("revalidate cloud-init dispatch ownership: %w", err)
+	if err := recordCloudInitUpload(recorder, uploadState, "revalidate cloud-init dispatch ownership"); err != nil {
+		return err
 	}
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("cloud-init dispatch context ended after ownership validation: %w", err)
@@ -207,7 +217,7 @@ func (c *APIClient) CloudInit(ctx context.Context, vm *proxmox.VirtualMachine, m
 		return fmt.Errorf("%w: cloud-init dispatch ownership lease expired before POST", capmox.ErrCloudInitUploadPending)
 	}
 
-	uploadTask, proven, err := uploadCloudInitISO(ctx, storage, storage.Name, isoPath, isoName, digest, size)
+	uploadTask, proven, err := uploadCloudInitISO(ctx, &contextCloudInitStorage{storage: storage, transport: c.uploadTransport}, storage.Name, isoPath, isoName, digest, size)
 	if err != nil {
 		return err
 	}
@@ -217,8 +227,8 @@ func (c *APIClient) CloudInit(ctx context.Context, vm *proxmox.VirtualMachine, m
 		}
 		uploadState.UPID = string(uploadTask.UPID)
 		uploadState.Phase = capmox.CloudInitUploadPhaseAccepted
-		if err := recorder(uploadState); err != nil {
-			return fmt.Errorf("record accepted cloud-init upload task: %w", err)
+		if err := recordCloudInitUpload(recorder, uploadState, "record accepted cloud-init upload task"); err != nil {
+			return err
 		}
 		if err := waitForCloudInitEffect(ctx, uploadTask, 5, "cloud-init ISO upload", true, func() error {
 			return requireCloudInitISO(ctx, storage, storage.Name, isoName, size)
@@ -227,11 +237,39 @@ func (c *APIClient) CloudInit(ctx context.Context, vm *proxmox.VirtualMachine, m
 		}
 	}
 	uploadState.Phase = capmox.CloudInitUploadPhaseComplete
-	if err := recorder(uploadState); err != nil {
-		return fmt.Errorf("record completed cloud-init upload: %w", err)
+	if err := recordCloudInitUpload(recorder, uploadState, "record completed cloud-init upload"); err != nil {
+		return err
 	}
 
 	return mountCloudInitISO(ctx, vm, machineIdentity, device, expectedVolID)
+}
+
+func (c *APIClient) prepareCloudInitAttempt(ctx context.Context, node *proxmox.Node, vm *proxmox.VirtualMachine, machineIdentity, device, isoName string, size uint64, current *capmox.CloudInitUpload, recorder capmox.CloudInitUploadRecorder) (uint64, bool, bool, error) {
+	if current == nil {
+		return 1, false, false, nil
+	}
+	recordedNode := node
+	if current.Node != vm.Node {
+		var err error
+		recordedNode, err = c.Client.Node(ctx, current.Node)
+		if err != nil {
+			return 0, false, false, fmt.Errorf("get recorded cloud-init node %q: %w", current.Node, err)
+		}
+	}
+	handled, rearmed, err := c.resumeCloudInitUpload(ctx, recordedNode, vm, machineIdentity, device, isoName, size, current, recorder)
+	if err != nil || handled {
+		return 0, false, handled, err
+	}
+	if rearmed {
+		return current.Attempt, true, false, nil
+	}
+	if current.Attempt == ^uint64(0) {
+		return 0, false, false, errors.New("cloud-init upload attempt generation overflow")
+	}
+	if current.Attempt > 0 {
+		return current.Attempt + 1, false, false, nil
+	}
+	return 1, false, false, nil
 }
 
 func (c *APIClient) resumeCloudInitUpload(ctx context.Context, node *proxmox.Node, vm *proxmox.VirtualMachine, machineIdentity, device, isoName string, size uint64, current *capmox.CloudInitUpload, recorder capmox.CloudInitUploadRecorder) (bool, bool, error) {
@@ -241,9 +279,6 @@ func (c *APIClient) resumeCloudInitUpload(ctx context.Context, node *proxmox.Nod
 	expectedVolID := current.Storage + ":iso/" + isoName
 	exact := current.VolID == expectedVolID && current.Size == size
 	if !exact {
-		if current.Phase == capmox.CloudInitUploadPhaseComplete {
-			return false, false, nil
-		}
 		if err := c.reconcileRecordedCloudInitUpload(ctx, node, machineIdentity, current); err != nil {
 			return true, false, fmt.Errorf("%w: reconcile superseded durable upload: %v", capmox.ErrCloudInitUploadPending, err)
 		}
@@ -287,8 +322,8 @@ func (c *APIClient) resumeCloudInitUpload(ctx context.Context, node *proxmox.Nod
 	if current.Phase != capmox.CloudInitUploadPhaseComplete {
 		completed := *current
 		completed.Phase = capmox.CloudInitUploadPhaseComplete
-		if err := recorder(completed); err != nil {
-			return true, false, fmt.Errorf("record resumed cloud-init upload completion: %w", err)
+		if err := recordCloudInitUpload(recorder, completed, "record resumed cloud-init upload completion"); err != nil {
+			return true, false, err
 		}
 	}
 	if err := mountCloudInitISO(ctx, vm, machineIdentity, device, expectedVolID); err != nil {
@@ -329,11 +364,18 @@ func (c *APIClient) resumeUnacknowledgedCloudInitUpload(ctx context.Context, nod
 	if err := claimCloudInitDispatch(&rearmed); err != nil {
 		return false, err
 	}
-	if err := recorder(rearmed); err != nil {
-		return false, fmt.Errorf("rearm quiescent cloud-init upload intent: %w", err)
+	if err := recordCloudInitUpload(recorder, rearmed, "rearm quiescent cloud-init upload intent"); err != nil {
+		return false, err
 	}
 	*current = rearmed
 	return true, nil
+}
+
+func recordCloudInitUpload(recorder capmox.CloudInitUploadRecorder, upload capmox.CloudInitUpload, boundary string) error {
+	if err := recorder(upload); err != nil {
+		return fmt.Errorf("%w: %s: %w", capmox.ErrCloudInitUploadPending, boundary, err)
+	}
+	return nil
 }
 
 func claimCloudInitDispatch(upload *capmox.CloudInitUpload) error {
@@ -597,7 +639,7 @@ func cloudInitISOName(machineIdentity, digest string) (string, error) {
 	return name, nil
 }
 
-func uploadCloudInitISO(ctx context.Context, storage cloudInitStorage, storageName, isoPath, isoName, digest string, size uint64) (*proxmox.Task, bool, error) {
+func uploadCloudInitISO(ctx context.Context, storage cloudInitUploadStorage, storageName, isoPath, isoName, digest string, size uint64) (*proxmox.Task, bool, error) {
 	present, err := inspectCloudInitISO(ctx, storage, storageName, isoName, size)
 	if err != nil {
 		return nil, false, fmt.Errorf("cloud-init ISO preflight failed: %w", err)
@@ -606,7 +648,7 @@ func uploadCloudInitISO(ctx context.Context, storage cloudInitStorage, storageNa
 		return nil, true, nil
 	}
 
-	task, err := storage.UploadWithHash(cloudInitISOContentType, isoPath, &isoName, digest, "sha256")
+	task, err := storage.UploadWithHash(ctx, cloudInitISOContentType, isoPath, &isoName, digest, "sha256")
 	if err == nil {
 		return task, false, nil
 	}
@@ -614,13 +656,22 @@ func uploadCloudInitISO(ctx context.Context, storage cloudInitStorage, storageNa
 		return nil, false, err
 	}
 
-	if proofErr := requireCloudInitISO(ctx, storage, storageName, isoName, size); proofErr != nil {
+	proofCtx := ctx
+	cancel := func() {}
+	if ctx.Err() != nil {
+		proofCtx, cancel = context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	}
+	defer cancel()
+	if proofErr := requireCloudInitISO(proofCtx, storage, storageName, isoName, size); proofErr != nil {
 		return nil, false, fmt.Errorf("cloud-init ISO upload response was ambiguous (%w) and storage proof failed: %v", err, proofErr)
 	}
 	return nil, true, nil
 }
 
 func isAmbiguousTransportError(err error) bool {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
 	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 		return true
 	}

@@ -41,7 +41,7 @@ func newTestClient(t *testing.T) *APIClient {
 	httpmock.RegisterResponder(http.MethodGet, testBaseURL+"api2/json/version",
 		newJSONResponder(200, proxmox.Version{Release: "test"}))
 
-	client, err := NewAPIClient(context.Background(), logr.Discard(), testBaseURL)
+	client, err := NewAPIClient(context.Background(), logr.Discard(), testBaseURL, http.DefaultClient)
 	require.NoError(t, err)
 
 	return client
@@ -49,6 +49,40 @@ func newTestClient(t *testing.T) *APIClient {
 
 func newJSONResponder(status int, data any) httpmock.Responder {
 	return httpmock.NewJsonResponderOrPanic(status, map[string]any{"data": data}).Once()
+}
+
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripperFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return f(request)
+}
+
+func TestUploadContextTransportPropagatesCancellationToUploadRequest(t *testing.T) {
+	requestStarted := make(chan struct{})
+	transport := &uploadContextTransport{base: roundTripperFunc(func(request *http.Request) (*http.Response, error) {
+		close(requestStarted)
+		<-request.Context().Done()
+		return nil, request.Context().Err()
+	})}
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, err := transport.withContext(ctx, func() (*proxmox.Task, error) {
+			request, requestErr := http.NewRequest(http.MethodPost, "http://pve.local.test/api2/json/nodes/pve/storage/local/upload", nil)
+			if requestErr != nil {
+				return nil, requestErr
+			}
+			response, requestErr := transport.RoundTrip(request)
+			if response != nil {
+				_ = response.Body.Close()
+			}
+			return nil, requestErr
+		})
+		result <- err
+	}()
+	<-requestStarted
+	cancel()
+	require.ErrorIs(t, <-result, context.Canceled)
 }
 
 func TestProxmoxAPIClient_GetReservableMemoryBytes(t *testing.T) {
@@ -773,6 +807,47 @@ func TestDeleteVMIntentWaitsForImgcopyThenAllowsAbsentVMFinalization(t *testing.
 	active = false
 	_, err = client.DeleteVM(context.Background(), "test", 320, "machine-uid", upload)
 	require.ErrorIs(t, err, ErrVMIDFree, "quiescent intent with exact artifact absence may release VM ownership")
+}
+
+func TestDeleteVMReconcilesRecordedUploadOnOriginalNodeAfterMigration(t *testing.T) {
+	client := newTestClient(t)
+	digest := cloudInitBootstrapDigest("migrated", "metadata", "", "network")
+	isoName := "user-data-machine-uid-" + digest + ".iso"
+	upload := &capmox.CloudInitUpload{
+		Version: 1, Node: "old-node", Storage: "shared", VolID: "shared:iso/" + isoName,
+		Size: 4096, Attempt: 1, Phase: capmox.CloudInitUploadPhaseComplete,
+	}
+	for _, nodeName := range []string{"new-node", "old-node"} {
+		httpmock.RegisterResponder(http.MethodGet, `=~/nodes/`+nodeName+`/status$`,
+			httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": proxmox.Node{Name: nodeName}}))
+	}
+	httpmock.RegisterResponder(http.MethodGet, `=~/cluster/status$`,
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": proxmox.NodeStatuses{{Name: "new-node"}, {Name: "old-node"}}}))
+	httpmock.RegisterResponder(http.MethodGet, `=~/cluster/nextid$`,
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": "320"}))
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/old-node/storage/shared/status$`,
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": proxmox.Storage{Name: "shared", Content: "iso", Enabled: 1}}))
+	present := true
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/old-node/storage/shared/content$`, func(*http.Request) (*http.Response, error) {
+		contents := []*proxmox.StorageContent{}
+		if present {
+			contents = append(contents, &proxmox.StorageContent{Volid: upload.VolID, Format: "iso", Size: upload.Size})
+		}
+		return httpmock.NewJsonResponse(200, map[string]any{"data": contents})
+	})
+	deleteUPID := proxmox.UPID("UPID:old-node:1:2:3:imgdel:shared:root@pam:")
+	httpmock.RegisterResponder(http.MethodDelete, `=~/nodes/old-node/storage/shared/content/.*$`, func(*http.Request) (*http.Response, error) {
+		present = false
+		return httpmock.NewJsonResponse(200, map[string]any{"data": deleteUPID})
+	})
+	httpmock.RegisterResponder(http.MethodGet, fmt.Sprintf(`=~/nodes/old-node/tasks/%s/status$`, string(deleteUPID)),
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": proxmox.Task{UPID: deleteUPID, Node: "old-node", Status: "stopped", ExitStatus: "OK"}}))
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/new-node/storage$`,
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": &proxmox.Storages{}}))
+
+	_, err := client.DeleteVM(context.Background(), "new-node", 320, "machine-uid", upload)
+	require.ErrorIs(t, err, ErrVMIDFree)
+	require.False(t, present)
 }
 
 func TestDeleteVMPresentWaitsForRecordedUploadThenCleansBeforeDeletion(t *testing.T) {

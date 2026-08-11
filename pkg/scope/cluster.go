@@ -181,8 +181,7 @@ func (s *ClusterScope) setupProxmoxClient(ctx context.Context) (capmox.Client, e
 	}
 
 	httpClient := &http.Client{Transport: tr}
-	return goproxmox.NewAPIClient(ctx, *s.Logger, url,
-		proxmox.WithHTTPClient(httpClient),
+	return goproxmox.NewAPIClient(ctx, *s.Logger, url, httpClient,
 		proxmox.WithAPIToken(token, tokenSecret),
 	)
 }

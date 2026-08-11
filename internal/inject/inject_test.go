@@ -417,7 +417,7 @@ func newTestClient(t *testing.T) *goproxmox.APIClient {
 	httpmock.RegisterResponder(http.MethodGet, baseURLWithTrailingSlash+"api2/json/version",
 		newJSONResponder(200, proxmox.Version{Release: "test"}, 1))
 
-	client, err := goproxmox.NewAPIClient(context.Background(), logr.Discard(), baseURLWithTrailingSlash)
+	client, err := goproxmox.NewAPIClient(context.Background(), logr.Discard(), baseURLWithTrailingSlash, http.DefaultClient)
 	require.NoError(t, err)
 
 	return client
