@@ -53,12 +53,13 @@ type fakeCloudInitStorage struct {
 	deletedVolume   string
 	deleteCalls     int
 	deleteErr       error
+	deleteTask      *proxmox.Task
 }
 
 func (s *fakeCloudInitStorage) DeleteContent(_ context.Context, content string) (*proxmox.Task, error) {
 	s.deleteCalls++
 	s.deletedVolume = content
-	return nil, s.deleteErr
+	return s.deleteTask, s.deleteErr
 }
 
 func (s *fakeCloudInitStorage) UploadWithHash(content, _ string, storageFilename *string, checksum, checksumAlgorithm string) (*proxmox.Task, error) {
@@ -227,6 +228,36 @@ func TestCloudInitConfigOptionsPreservesDefaultBoot(t *testing.T) {
 	require.Equal(t, []proxmox.VirtualMachineOption{{Name: "ide0", Value: "local:iso/owned.iso,media=cdrom"}}, options)
 }
 
+func TestCloudInitOwnershipTagTaskFailureBlocksContinuation(t *testing.T) {
+	client := newTestClient(t)
+	vmFixture := &proxmox.VirtualMachine{
+		Node: "pve", VMID: proxmox.StringOrUint64(320),
+		VirtualMachineConfig: &proxmox.VirtualMachineConfig{},
+	}
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve/status$`,
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": proxmox.Node{Name: "pve"}}))
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve/qemu/320/status/current$`,
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": vmFixture}))
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve/qemu/320/config$`,
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": vmFixture.VirtualMachineConfig}))
+	vm, err := client.GetVM(context.Background(), "pve", 320)
+	require.NoError(t, err)
+
+	upid := proxmox.UPID("UPID:pve:003B4235:1DF4ABCA:667C1C45:qmconfig:320:root@pam:")
+	configCalls := 0
+	httpmock.RegisterResponder(http.MethodPost, `=~/nodes/pve/qemu/320/config$`, func(*http.Request) (*http.Response, error) {
+		configCalls++
+		return httpmock.NewJsonResponse(200, map[string]any{"data": upid})
+	})
+	originalWait := waitForCloudInitTask
+	t.Cleanup(func() { waitForCloudInitTask = originalWait })
+	waitForCloudInitTask = func(context.Context, *proxmox.Task, int) error { return errors.New("tag task failed") }
+
+	err = addCloudInitOwnershipTag(context.Background(), vm)
+	require.ErrorContains(t, err, "wait for cloud-init ownership tag")
+	require.Equal(t, 1, configCalls, "failed ownership task must not advance to a mount config")
+}
+
 func TestOwnedCloudInitVolume(t *testing.T) {
 	digest := strings.Repeat("a", cloudInitDigestLength)
 	owned := "local:iso/user-data-machine-a-" + digest + ".iso,media=cdrom"
@@ -239,6 +270,10 @@ func TestOwnedCloudInitVolume(t *testing.T) {
 		"local:iso/user-data-machine-b-" + digest + ".iso,media=cdrom",
 		"local:iso/user-data-machine-a-short.iso,media=cdrom",
 		"local:iso/user-data-machine-a-" + digest + ".iso,media=disk",
+		"local:iso/user-data-machine-a-" + digest + ".iso,media=cdrom,media=cdrom",
+		"local:iso/user-data-machine-a-" + digest + ".iso,media=cdrom,media=disk",
+		"local:iso/user-data-machine-a-" + digest + ".iso,media=cdrom,size=4M,size=4M",
+		"local:iso/user-data-machine-a-" + digest + ".iso,media=cdrom,serial=unsafe",
 		"../local:iso/user-data-machine-a-" + digest + ".iso,media=cdrom",
 	} {
 		_, _, err := ownedCloudInitVolume(foreign, "machine-a")
@@ -343,6 +378,57 @@ func TestDeleteOwnedCloudInitVolumeAmbiguousResponse(t *testing.T) {
 	}
 }
 
+func TestDeleteOwnedCloudInitVolumeAuthoritativeRetry(t *testing.T) {
+	volID := "local:iso/user-data-machine-a-" + strings.Repeat("a", cloudInitDigestLength) + ".iso"
+	storage := &fakeCloudInitStorage{
+		deleteErr: errors.New("permission denied"),
+		results: []storageResult{
+			{contents: []*proxmox.StorageContent{{Volid: volID, Format: "iso"}}},
+			{contents: []*proxmox.StorageContent{{Volid: volID, Format: "iso"}}},
+			{},
+		},
+	}
+	deleted, err := deleteOwnedCloudInitVolume(context.Background(), storage, volID)
+	require.ErrorContains(t, err, "permission denied")
+	require.False(t, deleted)
+	require.Equal(t, 1, storage.deleteCalls)
+
+	storage.deleteErr = nil
+	deleted, err = deleteOwnedCloudInitVolume(context.Background(), storage, volID)
+	require.NoError(t, err)
+	require.True(t, deleted)
+	require.Equal(t, 2, storage.deleteCalls, "authoritative failure must retry rather than be swallowed")
+}
+
+func TestDeleteOwnedCloudInitVolumeTaskWaitAmbiguity(t *testing.T) {
+	volID := "local:iso/user-data-machine-a-" + strings.Repeat("a", cloudInitDigestLength) + ".iso"
+	originalWait := waitForCloudInitTask
+	t.Cleanup(func() { waitForCloudInitTask = originalWait })
+	waitForCloudInitTask = func(context.Context, *proxmox.Task, int) error { return io.ErrUnexpectedEOF }
+
+	storage := &fakeCloudInitStorage{
+		deleteTask: &proxmox.Task{},
+		results: []storageResult{
+			{contents: []*proxmox.StorageContent{{Volid: volID, Format: "iso"}}},
+			{},
+		},
+	}
+	deleted, err := deleteOwnedCloudInitVolume(context.Background(), storage, volID)
+	require.NoError(t, err)
+	require.True(t, deleted)
+
+	storage = &fakeCloudInitStorage{
+		deleteTask: &proxmox.Task{},
+		results: []storageResult{
+			{contents: []*proxmox.StorageContent{{Volid: volID, Format: "iso"}}},
+			{contents: []*proxmox.StorageContent{{Volid: volID, Format: "iso"}}},
+		},
+	}
+	deleted, err = deleteOwnedCloudInitVolume(context.Background(), storage, volID)
+	require.ErrorContains(t, err, "absence proof failed")
+	require.False(t, deleted)
+}
+
 func TestOwnedCloudInitCandidate(t *testing.T) {
 	digestA := strings.Repeat("a", cloudInitDigestLength)
 	digestB := strings.Repeat("b", cloudInitDigestLength)
@@ -397,7 +483,11 @@ func TestCloudInitRecoveredUploadTagsMountsAndPreservesBoot(t *testing.T) {
 	require.NoError(t, err)
 
 	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve/storage$`,
-		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": &proxmox.Storages{{Name: "local", Content: "iso", Enabled: 1}}}))
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": &proxmox.Storages{
+			{Name: "local", Content: "iso", Enabled: 1},
+			{Name: "disabled", Content: "iso", Enabled: 0},
+			{Name: "backup", Content: "backup", Enabled: 1},
+		}}))
 
 	var uploadedName, uploadedChecksum, uploadedAlgorithm, uploadedDigest string
 	var uploadedSize uint64
@@ -473,7 +563,33 @@ func TestCloudInitRecoveredUploadTagsMountsAndPreservesBoot(t *testing.T) {
 	require.NoError(t, decodeErr)
 }
 
-func TestUnmountCloudInitISORecoversAfterUnmountAndTagFailure(t *testing.T) {
+func TestRecoverOwnedCloudInitVolumeRejectsCrossStorageDuplicates(t *testing.T) {
+	client := newTestClient(t)
+	digestA := strings.Repeat("a", cloudInitDigestLength)
+	digestB := strings.Repeat("b", cloudInitDigestLength)
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve/status$`,
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": proxmox.Node{Name: "pve"}}))
+	node, err := client.Node(context.Background(), "pve")
+	require.NoError(t, err)
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve/storage$`,
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": &proxmox.Storages{
+			{Name: "local", Content: "iso", Enabled: 1},
+			{Name: "other", Content: "images,iso", Enabled: 1},
+		}}))
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve/storage/local/content$`,
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": []*proxmox.StorageContent{{
+			Volid: "local:iso/user-data-machine-uid-" + digestA + ".iso", Format: "iso",
+		}}}))
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve/storage/other/content$`,
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": []*proxmox.StorageContent{{
+			Volid: "other:iso/user-data-machine-uid-" + digestB + ".iso", Format: "iso",
+		}}}))
+
+	_, _, err = recoverOwnedCloudInitVolume(context.Background(), node, "machine-uid")
+	require.ErrorContains(t, err, "multiple owned")
+}
+
+func TestUnmountCloudInitISOAcceptsNormalizedMountAndRecoversAfterTagFailure(t *testing.T) {
 	client := newTestClient(t)
 	digest := strings.Repeat("a", cloudInitDigestLength)
 	volID := "local:iso/user-data-machine-uid-" + digest + ".iso"
@@ -482,7 +598,7 @@ func TestUnmountCloudInitISORecoversAfterUnmountAndTagFailure(t *testing.T) {
 		Node: "pve",
 		VMID: proxmox.StringOrUint64(320),
 		VirtualMachineConfig: &proxmox.VirtualMachineConfig{
-			IDE0: "none,media=cdrom", Tags: cloudInitTag, TagsSlice: []string{cloudInitTag},
+			IDE0: volID + ",media=cdrom,size=4M", Tags: cloudInitTag, TagsSlice: []string{cloudInitTag},
 		},
 	}
 	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve/status$`,
@@ -496,6 +612,8 @@ func TestUnmountCloudInitISORecoversAfterUnmountAndTagFailure(t *testing.T) {
 
 	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve/storage$`,
 		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": &proxmox.Storages{{Name: "local", Content: "iso", Enabled: 1}}}))
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve/storage/local/status$`,
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": &proxmox.Storage{Name: "local", Content: "iso", Enabled: 1}}))
 	contentPresent := true
 	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve/storage/local/content$`, func(*http.Request) (*http.Response, error) {
 		contents := []*proxmox.StorageContent{}
@@ -518,7 +636,14 @@ func TestUnmountCloudInitISORecoversAfterUnmountAndTagFailure(t *testing.T) {
 		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": completedTask}))
 
 	tagCalls := 0
-	httpmock.RegisterResponder(http.MethodPost, `=~/nodes/pve/qemu/320/config$`, func(*http.Request) (*http.Response, error) {
+	unmountCalls := 0
+	httpmock.RegisterResponder(http.MethodPost, `=~/nodes/pve/qemu/320/config$`, func(request *http.Request) (*http.Response, error) {
+		config := map[string]string{}
+		require.NoError(t, json.NewDecoder(request.Body).Decode(&config))
+		if config["ide0"] == cloudInitUnmountedDeviceValue {
+			unmountCalls++
+			return httpmock.NewJsonResponse(200, map[string]any{"data": upid})
+		}
 		tagCalls++
 		if tagCalls == 1 {
 			return httpmock.NewStringResponse(500, "tag update failed"), nil
@@ -530,11 +655,13 @@ func TestUnmountCloudInitISORecoversAfterUnmountAndTagFailure(t *testing.T) {
 	require.Error(t, err, "the first pass must surface tag removal failure after exact deletion")
 	require.Equal(t, 1, deleteCalls)
 	require.False(t, contentPresent)
+	require.Equal(t, 1, unmountCalls)
 
 	// A real reconciliation refetches the still-tagged VM after the failed tag
 	// update. Exact absence is then safe replay state and no second delete occurs.
 	vm.VirtualMachineConfig.Tags = cloudInitTag
 	vm.VirtualMachineConfig.TagsSlice = []string{cloudInitTag}
+	vm.VirtualMachineConfig.IDE0 = cloudInitUnmountedDeviceValue
 	err = client.UnmountCloudInitISO(context.Background(), vm, "machine-uid", "ide0")
 	require.NoError(t, err)
 	require.Equal(t, 1, deleteCalls)

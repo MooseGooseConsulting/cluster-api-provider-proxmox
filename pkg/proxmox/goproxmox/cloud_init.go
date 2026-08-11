@@ -39,7 +39,12 @@ const (
 	cloudInitDigestLength          = sha256.Size * 2
 	maxPVEStorageFilenameLength    = 255
 	cloudInitStorageFilenamePrefix = "user-data-"
+	cloudInitUnmountedDeviceValue  = "none,media=cdrom"
 )
+
+var waitForCloudInitTask = func(ctx context.Context, task *proxmox.Task, attempts int) error {
+	return task.WaitFor(ctx, attempts)
+}
 
 type cloudInitStorage interface {
 	UploadWithHash(content, file string, storageFilename *string, checksum, checksumAlgorithm string) (*proxmox.Task, error)
@@ -90,7 +95,7 @@ func (c *APIClient) CloudInit(ctx context.Context, vm *proxmox.VirtualMachine, m
 		}
 	}
 
-	if _, err := vm.AddTag(ctx, proxmox.MakeTag(proxmox.TagCloudInit)); err != nil && !proxmox.IsErrNoop(err) {
+	if err := addCloudInitOwnershipTag(ctx, vm); err != nil {
 		return err
 	}
 
@@ -100,6 +105,22 @@ func (c *APIClient) CloudInit(ctx context.Context, vm *proxmox.VirtualMachine, m
 		return err
 	}
 	return configTask.WaitFor(ctx, 2)
+}
+
+func addCloudInitOwnershipTag(ctx context.Context, vm *proxmox.VirtualMachine) error {
+	tagTask, err := vm.AddTag(ctx, proxmox.MakeTag(proxmox.TagCloudInit))
+	if err != nil && !proxmox.IsErrNoop(err) {
+		return err
+	}
+	if err == nil {
+		if tagTask == nil {
+			return errors.New("cloud-init ownership tag returned no task")
+		}
+		if err := waitForCloudInitTask(ctx, tagTask, 2); err != nil {
+			return fmt.Errorf("wait for cloud-init ownership tag: %w", err)
+		}
+	}
+	return nil
 }
 
 func cloudInitBootstrapDigest(userdata, metadata, vendordata, networkconfig string) string {
@@ -225,8 +246,31 @@ func cloudInitConfigOptions(vm *proxmox.VirtualMachine, device, volID string) []
 
 func ownedCloudInitVolume(deviceValue, machineIdentity string) (storageName, volID string, err error) {
 	parts := strings.Split(deviceValue, ",")
-	if len(parts) != 2 || parts[1] != "media=cdrom" {
+	if len(parts) < 2 {
 		return "", "", fmt.Errorf("cloud-init device is not an exact ISO mount")
+	}
+	seenMedia := false
+	seenSize := false
+	for _, option := range parts[1:] {
+		switch {
+		case option == "media=cdrom":
+			if seenMedia {
+				return "", "", fmt.Errorf("cloud-init device has duplicate media option")
+			}
+			seenMedia = true
+		case strings.HasPrefix(option, "media="):
+			return "", "", fmt.Errorf("cloud-init device has conflicting media option")
+		case strings.HasPrefix(option, "size="):
+			if seenSize || !isNormalizedPVESize(strings.TrimPrefix(option, "size=")) {
+				return "", "", fmt.Errorf("cloud-init device has invalid normalized size option")
+			}
+			seenSize = true
+		default:
+			return "", "", fmt.Errorf("cloud-init device has unsupported normalized option %q", option)
+		}
+	}
+	if !seenMedia {
+		return "", "", fmt.Errorf("cloud-init device is missing media=cdrom")
 	}
 	storageAndName := strings.Split(parts[0], ":iso/")
 	if len(storageAndName) != 2 || !isSafePVEStorageName(storageAndName[0]) {
@@ -243,6 +287,19 @@ func ownedCloudInitVolume(deviceValue, machineIdentity string) (storageName, vol
 		return "", "", fmt.Errorf("cloud-init device has invalid content-addressed filename")
 	}
 	return storageAndName[0], parts[0], nil
+}
+
+func isNormalizedPVESize(value string) bool {
+	if value == "" {
+		return false
+	}
+	for index, char := range value {
+		if char >= '0' && char <= '9' {
+			continue
+		}
+		return index > 0 && index == len(value)-1 && strings.ContainsRune("KMGTP", char)
+	}
+	return true
 }
 
 func isSafePVEStorageName(name string) bool {
@@ -298,7 +355,7 @@ func deleteOwnedCloudInitVolume(ctx context.Context, storage cloudInitStorage, v
 		return true, nil
 	}
 	if task != nil {
-		if waitErr := task.WaitFor(ctx, 2); waitErr != nil {
+		if waitErr := waitForCloudInitTask(ctx, task, 2); waitErr != nil {
 			stillPresent, proofErr := inspectOwnedCloudInitVolume(ctx, storage, volID)
 			if proofErr != nil || stillPresent {
 				return false, fmt.Errorf("cloud-init volume delete task failed (%w) and absence proof failed: %v", waitErr, proofErr)

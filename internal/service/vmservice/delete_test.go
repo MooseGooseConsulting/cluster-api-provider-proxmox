@@ -36,7 +36,7 @@ func TestDeleteVM_SuccessNotFound(t *testing.T) {
 		Node:    "node1",
 	}, false)
 
-	proxmoxClient.EXPECT().DeleteVM(context.TODO(), "node1", int64(123)).Return(nil, errors.New("vm does not exist: some reason")).Once()
+	proxmoxClient.EXPECT().DeleteVM(context.TODO(), "node1", int64(123), string(machineScope.ProxmoxMachine.UID)).Return(nil, errors.New("vm does not exist: some reason")).Once()
 
 	require.NoError(t, DeleteVM(context.TODO(), machineScope))
 	require.Empty(t, machineScope.ProxmoxMachine.Finalizers)

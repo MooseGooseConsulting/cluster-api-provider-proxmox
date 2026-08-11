@@ -37,7 +37,7 @@ type Client interface {
 
 	GetVM(ctx context.Context, nodeName string, vmID int64) (*proxmox.VirtualMachine, error)
 
-	DeleteVM(ctx context.Context, nodeName string, vmID int64) (*proxmox.Task, error)
+	DeleteVM(ctx context.Context, nodeName string, vmID int64, machineIdentity string) (*proxmox.Task, error)
 
 	GetTask(ctx context.Context, upID string) (*proxmox.Task, error)
 

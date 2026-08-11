@@ -36,7 +36,7 @@ func DeleteVM(ctx context.Context, machineScope *scope.MachineScope) error {
 	vmID := machineScope.ProxmoxMachine.GetVirtualMachineID()
 	node := machineScope.LocateProxmoxNode()
 
-	if _, err := machineScope.InfraCluster.ProxmoxClient.DeleteVM(ctx, node, vmID); err != nil {
+	if _, err := machineScope.InfraCluster.ProxmoxClient.DeleteVM(ctx, node, vmID, string(machineScope.ProxmoxMachine.UID)); err != nil {
 		if VMNotFound(err) || errors.Is(err, goproxmox.ErrVMIDFree) {
 			// remove machine from cluster status
 			machineScope.InfraCluster.ProxmoxCluster.RemoveNodeLocation(machineScope.Name(), util.IsControlPlaneMachine(machineScope.Machine))

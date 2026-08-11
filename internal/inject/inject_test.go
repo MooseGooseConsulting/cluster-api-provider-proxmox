@@ -146,7 +146,7 @@ func TestISOInjectorInjectCloudInit(t *testing.T) {
 		captureUploadResponder(t, &uploadedName, &uploadedSize, ptask.UPID))
 
 	httpmock.RegisterResponder(http.MethodGet, fmt.Sprintf(`=~/nodes/%s/tasks/%s/status`, "pve", string(ptask.UPID)),
-		newJSONResponder(200, ptask, 4))
+		newJSONResponder(200, ptask, 6))
 
 	httpmock.RegisterResponder(http.MethodPost, fmt.Sprintf(`=~/nodes/%s/qemu/%d/config`, "pve", 100),
 		newJSONResponder(200, ptask.UPID, 2))
@@ -269,7 +269,7 @@ func TestISOInjectorInjectIgnition(t *testing.T) {
 		captureUploadResponder(t, &uploadedName, &uploadedSize, ptask.UPID))
 
 	httpmock.RegisterResponder(http.MethodGet, fmt.Sprintf(`=~/nodes/%s/tasks/%s/status`, "pve", string(ptask.UPID)),
-		newJSONResponder(200, ptask, 4))
+		newJSONResponder(200, ptask, 6))
 
 	httpmock.RegisterResponder(http.MethodPost, fmt.Sprintf(`=~/nodes/%s/qemu/%d/config`, "pve", 100),
 		newJSONResponder(200, ptask.UPID, 2))

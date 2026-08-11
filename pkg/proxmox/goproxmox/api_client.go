@@ -213,7 +213,7 @@ NEXT_VM:
 }
 
 // DeleteVM deletes a VM based on the nodeName and vmID.
-func (c *APIClient) DeleteVM(ctx context.Context, nodeName string, vmID int64) (*proxmox.Task, error) {
+func (c *APIClient) DeleteVM(ctx context.Context, nodeName string, vmID int64, machineIdentity string) (*proxmox.Task, error) {
 	// A vmID can not be lower than 100.
 	// If the provided vmID is lower (like -1 in issue #31), just error out without calling the API.
 	if vmID < 100 {
@@ -244,6 +244,11 @@ func (c *APIClient) DeleteVM(ctx context.Context, nodeName string, vmID int64) (
 	if vm.IsRunning() {
 		if _, err = vm.Stop(ctx); err != nil {
 			return nil, fmt.Errorf("cannot stop vm id %d: %w", vmID, err)
+		}
+	}
+	if vm.HasTag(proxmox.MakeTag(proxmox.TagCloudInit)) {
+		if err := c.UnmountCloudInitISO(ctx, vm, machineIdentity, "ide0"); err != nil {
+			return nil, fmt.Errorf("cannot clean cloud-init ISO before deleting vm id %d: %w", vmID, err)
 		}
 	}
 
@@ -361,7 +366,7 @@ func (c *APIClient) UnmountCloudInitISO(ctx context.Context, vm *proxmox.Virtual
 	deviceValue := vm.VirtualMachineConfig.IDE0
 	var storage *proxmox.Storage
 	var volID string
-	if deviceValue == "" || deviceValue == "none,media=cdrom" {
+	if deviceValue == "" || deviceValue == cloudInitUnmountedDeviceValue {
 		storage, volID, err = recoverOwnedCloudInitVolume(ctx, node, machineIdentity)
 		if err != nil {
 			return err
@@ -379,7 +384,7 @@ func (c *APIClient) UnmountCloudInitISO(ctx context.Context, vm *proxmox.Virtual
 			return fmt.Errorf("inspect mounted cloud-init volume: %w", err)
 		}
 		volID = mountedVolID
-		unmountTask, unmountErr := vm.Config(ctx, proxmox.VirtualMachineOption{Name: device, Value: "none,media=cdrom"})
+		unmountTask, unmountErr := vm.Config(ctx, proxmox.VirtualMachineOption{Name: device, Value: cloudInitUnmountedDeviceValue})
 		if unmountErr != nil {
 			return fmt.Errorf("unable to unmount cloud-init iso: %w", unmountErr)
 		}
@@ -414,7 +419,7 @@ func recoverOwnedCloudInitVolume(ctx context.Context, node *proxmox.Node, machin
 	var matchedStorage *proxmox.Storage
 	var matchedVolID string
 	for _, storage := range storages {
-		if storage.Enabled == 0 || !strings.Contains(storage.Content, "iso") {
+		if storage.Enabled == 0 || !storageSupportsContent(storage.Content, cloudInitISOContentType) {
 			continue
 		}
 		contents, err := storage.GetContent(ctx)
@@ -435,6 +440,15 @@ func recoverOwnedCloudInitVolume(ctx context.Context, node *proxmox.Node, machin
 		matchedVolID = volID
 	}
 	return matchedStorage, matchedVolID, nil
+}
+
+func storageSupportsContent(configured, expected string) bool {
+	for _, content := range strings.Split(configured, ",") {
+		if content == expected {
+			return true
+		}
+	}
+	return false
 }
 
 // CloudInitStatus returns the cloud-init status of the VM.
