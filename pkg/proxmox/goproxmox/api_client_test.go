@@ -291,8 +291,10 @@ func assertDeleteVMPresentNarrowRecordedCleanupSkipsBroadRecovery(t *testing.T, 
 		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": []*proxmox.Storage{{Name: "local", Content: "iso", Enabled: 1}, {Name: "vmdata", Content: "iso", Enabled: 1}}}))
 	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/test/storage/vmdata/status$`,
 		httpmock.NewJsonResponderOrPanic(500, map[string]any{"errors": "unavailable unrelated storage"}))
-	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/test/tasks/.+/status$`,
-		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": map[string]any{"status": "stopped", "exitstatus": "OK"}}))
+	if phase == capmox.CloudInitUploadPhaseAccepted {
+		httpmock.RegisterResponder(http.MethodGet, `=~/nodes/test/tasks/.+/status$`,
+			httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": map[string]any{"status": "stopped", "exitstatus": "OK"}}))
+	}
 	httpmock.RegisterResponder(http.MethodGet, `=~/cluster/status$`,
 		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": proxmox.NodeStatuses{{Name: "test"}}}))
 	httpmock.RegisterResponder(http.MethodGet, `=~/cluster/nextid$`,
