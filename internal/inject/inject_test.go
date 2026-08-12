@@ -416,6 +416,11 @@ func newTestClient(t *testing.T) *goproxmox.APIClient {
 
 	httpmock.RegisterResponder(http.MethodGet, baseURLWithTrailingSlash+"api2/json/version",
 		newJSONResponder(200, proxmox.Version{Release: "test"}, 1))
+	httpmock.RegisterResponder(http.MethodGet, `=~/cluster/status$`,
+		newJSONResponder(200, []map[string]any{
+			{"type": "cluster", "id": "cluster", "name": "test", "version": 1, "quorate": 1},
+			{"type": "node", "id": "node/pve", "name": "pve", "online": 1, "ip": "192.0.2.10"},
+		}, 1))
 
 	client, err := goproxmox.NewAPIClient(context.Background(), logr.Discard(), baseURLWithTrailingSlash, http.DefaultClient)
 	require.NoError(t, err)

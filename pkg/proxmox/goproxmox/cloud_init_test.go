@@ -867,6 +867,7 @@ func TestMakeCloudInitISOErrorRemovesTemporaryFile(t *testing.T) {
 
 func TestCloudInitRecoveredUploadTagsMountsAndPreservesBoot(t *testing.T) {
 	client := newTestClient(t)
+	registerCloudInitUploadNode("pve", "192.0.2.10")
 	vmFixture := &proxmox.VirtualMachine{
 		Node: "pve",
 		VMID: proxmox.StringOrUint64(320),
@@ -1139,6 +1140,7 @@ func TestCloudInitCancellationDefersRecoveryAndMountToSuccessor(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			client := newTestClient(t)
+			registerCloudInitUploadNode("pve", "192.0.2.10")
 			const (
 				userdata      = "user-data"
 				metadata      = "meta-data"
@@ -1231,6 +1233,7 @@ func TestCloudInitCancellationDefersRecoveryAndMountToSuccessor(t *testing.T) {
 
 func TestCloudInitRearmsQuiescentIntentAndDispatchesExactlyOnce(t *testing.T) {
 	client := newTestClient(t)
+	registerCloudInitUploadNode("pve", "192.0.2.10")
 	const (
 		userdata      = "user-data"
 		metadata      = "meta-data"
@@ -1256,8 +1259,6 @@ func TestCloudInitRearmsQuiescentIntentAndDispatchesExactlyOnce(t *testing.T) {
 	vm.New(client.Client, "pve", 320)
 	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve/status$`,
 		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": proxmox.Node{Name: "pve"}}))
-	httpmock.RegisterResponder(http.MethodGet, `=~/cluster/status$`,
-		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": proxmox.NodeStatuses{{Name: "pve"}}}))
 	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve/storage/local/status$`,
 		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": proxmox.Storage{Name: "local", Content: "iso", Enabled: 1, Avail: 1 << 30}}))
 	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve/storage$`,
@@ -1516,6 +1517,7 @@ func TestCloudInitRequiresCurrentOwnershipImmediatelyBeforePOST(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			client := newTestClient(t)
+			registerCloudInitUploadNode("pve", "192.0.2.10")
 			const (
 				userdata      = "user-data"
 				metadata      = "meta-data"

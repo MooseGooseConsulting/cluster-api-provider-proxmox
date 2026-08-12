@@ -23,7 +23,9 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"slices"
 	"strings"
@@ -53,20 +55,36 @@ type APIClient struct {
 }
 
 type uploadContextTransport struct {
-	base    http.RoundTripper
-	serial  sync.Mutex
-	mu      sync.RWMutex
+	base   http.RoundTripper
+	serial sync.Mutex
+	mu     sync.RWMutex
+	route  *cloudInitUploadRoute
+}
+
+type cloudInitUploadRoute struct {
 	context context.Context
+	path    string
+	address netip.Addr
 }
 
 func (t *uploadContextTransport) RoundTrip(request *http.Request) (*http.Response, error) {
-	if strings.HasSuffix(request.URL.Path, "/upload") {
+	if isProxmoxStorageUploadRequest(request) {
 		t.mu.RLock()
-		ctx := t.context
+		route := t.route
 		t.mu.RUnlock()
-		if ctx != nil {
-			request = request.Clone(ctx)
+		if route == nil {
+			if request.Body != nil {
+				_ = request.Body.Close()
+			}
+			return nil, errors.New("cloud-init upload request has no direct-node route")
 		}
+		if request.URL.EscapedPath() != route.path {
+			if request.Body != nil {
+				_ = request.Body.Close()
+			}
+			return nil, fmt.Errorf("cloud-init upload request path %q does not match direct-node route %q", request.URL.EscapedPath(), route.path)
+		}
+		request = request.Clone(route.context)
 		if request.Body == nil {
 			return nil, errors.New("cloud-init upload request requires a finite body")
 		}
@@ -96,19 +114,41 @@ func (t *uploadContextTransport) RoundTrip(request *http.Request) (*http.Respons
 		request.GetBody = func() (io.ReadCloser, error) {
 			return io.NopCloser(bytes.NewReader(body)), nil
 		}
+		port := request.URL.Port()
+		switch {
+		case port != "":
+			request.URL.Host = net.JoinHostPort(route.address.String(), port)
+		case route.address.Is6():
+			request.URL.Host = "[" + route.address.String() + "]"
+		default:
+			request.URL.Host = route.address.String()
+		}
+		request.Host = ""
 	}
 	return t.base.RoundTrip(request)
 }
 
-func (t *uploadContextTransport) withContext(ctx context.Context, dispatch func() (*proxmox.Task, error)) (*proxmox.Task, error) {
+func isProxmoxStorageUploadRequest(request *http.Request) bool {
+	if request.Method != http.MethodPost {
+		return false
+	}
+	parts := strings.Split(strings.Trim(request.URL.Path, "/"), "/")
+	return len(parts) == 7 && parts[0] == "api2" && parts[1] == "json" && parts[2] == "nodes" && parts[3] != "" && parts[4] == "storage" && parts[5] != "" && parts[6] == "upload"
+}
+
+func cloudInitUploadRequestPath(node, storage string) string {
+	return "/api2/json/nodes/" + url.PathEscape(node) + "/storage/" + url.PathEscape(storage) + "/upload"
+}
+
+func (t *uploadContextTransport) withRoute(ctx context.Context, node, storage string, address netip.Addr, dispatch func() (*proxmox.Task, error)) (*proxmox.Task, error) {
 	t.serial.Lock()
 	defer t.serial.Unlock()
 	t.mu.Lock()
-	t.context = ctx
+	t.route = &cloudInitUploadRoute{context: ctx, path: cloudInitUploadRequestPath(node, storage), address: address}
 	t.mu.Unlock()
 	defer func() {
 		t.mu.Lock()
-		t.context = nil
+		t.route = nil
 		t.mu.Unlock()
 	}()
 	return dispatch()
