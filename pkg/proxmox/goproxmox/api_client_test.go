@@ -1109,9 +1109,14 @@ func TestDeleteVMIntentWaitsForImgcopyThenAllowsAbsentVMFinalization(t *testing.
 	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/test/storage/local/status$`,
 		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": proxmox.Storage{Name: "local", Content: "iso", Enabled: 1}}))
 	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/test/storage$`,
-		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": &proxmox.Storages{{Name: "local", Content: "iso", Enabled: 1}}}))
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": &proxmox.Storages{
+			{Name: "local", Content: "iso", Enabled: 1},
+			{Name: "vmdata", Content: "iso", Enabled: 1},
+		}}))
 	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/test/storage/local/content$`,
 		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": []*proxmox.StorageContent{}}))
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/test/storage/vmdata/content$`,
+		httpmock.NewJsonResponderOrPanic(500, map[string]any{"errors": "unavailable unrelated storage"}))
 	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/test/tasks\?limit=1&source=active&typefilter=imgcopy$`, func(*http.Request) (*http.Response, error) {
 		tasks := []*proxmox.Task{}
 		if active {
@@ -1127,6 +1132,8 @@ func TestDeleteVMIntentWaitsForImgcopyThenAllowsAbsentVMFinalization(t *testing.
 	active = false
 	_, err = client.DeleteVM(context.Background(), "test", 320, "machine-uid", upload)
 	require.ErrorIs(t, err, ErrVMIDFree, "quiescent intent with exact artifact absence may release VM ownership")
+	require.Zero(t, httpmock.GetCallCountInfo()["GET =~/nodes/test/storage/vmdata/content$"],
+		"a durable upload record must not fall back to broad storage recovery")
 }
 
 func TestDeleteVMReconcilesRecordedUploadOnOriginalNodeAfterMigration(t *testing.T) {
