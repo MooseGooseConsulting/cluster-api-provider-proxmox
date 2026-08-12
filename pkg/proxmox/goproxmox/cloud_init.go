@@ -109,14 +109,18 @@ type cloudInitUploadStorage interface {
 }
 
 type contextCloudInitStorage struct {
-	storage   *proxmox.Storage
-	transport *uploadContextTransport
-	node      string
-	address   netip.Addr
+	storage      *proxmox.Storage
+	transport    *uploadContextTransport
+	node         string
+	prepareRoute func() (netip.Addr, error)
 }
 
 func (s *contextCloudInitStorage) UploadWithHash(ctx context.Context, content, file string, storageFilename *string, checksum, checksumAlgorithm string) (*proxmox.Task, error) {
-	return s.transport.withRoute(ctx, s.node, s.storage.Name, s.address, func() (*proxmox.Task, error) {
+	address, err := s.prepareRoute()
+	if err != nil {
+		return nil, err
+	}
+	return s.transport.withRoute(ctx, s.node, s.storage.Name, address, func() (*proxmox.Task, error) {
 		return s.storage.UploadWithHash(content, file, storageFilename, checksum, checksumAlgorithm)
 	})
 }
@@ -207,10 +211,6 @@ func (c *APIClient) CloudInit(ctx context.Context, vm *proxmox.VirtualMachine, m
 		}
 		return finishCloudInitMount(ctx, vm, machineIdentity, device, expectedVolID)
 	}
-	uploadAddress, err := c.resolveCloudInitUploadAddress(ctx, vm.Node)
-	if err != nil {
-		return err
-	}
 	if !intentAlreadyRecorded {
 		if err := claimCloudInitDispatch(&uploadState); err != nil {
 			return err
@@ -221,18 +221,27 @@ func (c *APIClient) CloudInit(ctx context.Context, vm *proxmox.VirtualMachine, m
 			return err
 		}
 	}
-	uploadState.Phase = capmox.CloudInitUploadPhaseDispatching
-	if err := recordCloudInitUpload(recorder, uploadState, "revalidate cloud-init dispatch ownership"); err != nil {
-		return err
+	routedStorage := &contextCloudInitStorage{
+		storage: storage, transport: c.uploadTransport, node: vm.Node,
+		prepareRoute: func() (netip.Addr, error) {
+			uploadAddress, err := c.resolveCloudInitUploadAddress(ctx, vm.Node)
+			if err != nil {
+				return netip.Addr{}, err
+			}
+			uploadState.Phase = capmox.CloudInitUploadPhaseDispatching
+			if err := recordCloudInitUpload(recorder, uploadState, "revalidate cloud-init dispatch ownership"); err != nil {
+				return netip.Addr{}, err
+			}
+			if err := ctx.Err(); err != nil {
+				return netip.Addr{}, fmt.Errorf("%w: cloud-init dispatch context ended after ownership validation: %w", capmox.ErrCloudInitUploadPending, err)
+			}
+			if cloudInitDispatchNow().Unix() >= uploadState.LeaseUntilUnix {
+				return netip.Addr{}, fmt.Errorf("%w: cloud-init dispatch ownership lease expired before POST", capmox.ErrCloudInitUploadPending)
+			}
+			return uploadAddress, nil
+		},
 	}
-	if err := ctx.Err(); err != nil {
-		return fmt.Errorf("%w: cloud-init dispatch context ended after ownership validation: %w", capmox.ErrCloudInitUploadPending, err)
-	}
-	if cloudInitDispatchNow().Unix() >= uploadState.LeaseUntilUnix {
-		return fmt.Errorf("%w: cloud-init dispatch ownership lease expired before POST", capmox.ErrCloudInitUploadPending)
-	}
-
-	uploadTask, proven, err := uploadCloudInitISO(ctx, &contextCloudInitStorage{storage: storage, transport: c.uploadTransport, node: vm.Node, address: uploadAddress}, storage.Name, isoPath, isoName, digest, size)
+	uploadTask, proven, err := uploadCloudInitISO(ctx, routedStorage, storage.Name, isoPath, isoName, digest, size)
 	if err != nil {
 		return err
 	}

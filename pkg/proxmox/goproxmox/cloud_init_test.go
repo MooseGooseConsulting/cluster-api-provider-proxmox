@@ -983,7 +983,7 @@ func TestCloudInitRecoveredUploadTagsMountsAndPreservesBoot(t *testing.T) {
 	require.NoError(t, decodeErr)
 }
 
-func TestCloudInitReusesExactArtifactWithoutClusterStatus(t *testing.T) {
+func TestCloudInitFinalPreflightReusesExactArtifactWithoutClusterStatus(t *testing.T) {
 	client := newTestClient(t)
 	const (
 		userdata      = "user-data"
@@ -1006,8 +1006,15 @@ func TestCloudInitReusesExactArtifactWithoutClusterStatus(t *testing.T) {
 		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": proxmox.Node{Name: "pve"}}))
 	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve/storage$`,
 		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": &proxmox.Storages{{Name: "local", Content: "iso", Enabled: 1, Avail: 1 << 30}}}))
-	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve/storage/local/content$`,
-		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": []*proxmox.StorageContent{{Volid: expectedVolID, Format: "iso", Size: size}}}))
+	contentCalls := 0
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve/storage/local/content$`, func(*http.Request) (*http.Response, error) {
+		contentCalls++
+		contents := []*proxmox.StorageContent{}
+		if contentCalls > 1 {
+			contents = append(contents, &proxmox.StorageContent{Volid: expectedVolID, Format: "iso", Size: size})
+		}
+		return httpmock.NewJsonResponse(200, map[string]any{"data": contents})
+	})
 	mountUPID := proxmox.UPID("UPID:pve:1:2:3:qmconfig:320:root@pam:")
 	mountCalls := 0
 	httpmock.RegisterResponder(http.MethodPost, `=~/nodes/pve/qemu/320/config$`, func(request *http.Request) (*http.Response, error) {
@@ -1031,9 +1038,11 @@ func TestCloudInitReusesExactArtifactWithoutClusterStatus(t *testing.T) {
 		return nil
 	})
 	require.NoError(t, err)
-	require.Len(t, recorded, 1)
-	require.Equal(t, capmox.CloudInitUploadPhaseComplete, recorded[0].Phase)
-	require.Equal(t, expectedVolID, recorded[0].VolID)
+	require.Len(t, recorded, 2)
+	require.Equal(t, capmox.CloudInitUploadPhaseIntent, recorded[0].Phase)
+	require.Equal(t, capmox.CloudInitUploadPhaseComplete, recorded[1].Phase)
+	require.Equal(t, expectedVolID, recorded[1].VolID)
+	require.Equal(t, 2, contentCalls, "the artifact must appear only at the final pre-dispatch preflight")
 	require.Equal(t, 1, mountCalls)
 	require.Zero(t, httpmock.GetCallCountInfo()["GET =~/cluster/status$"], "exact artifact reuse must not require direct-node discovery")
 	require.Zero(t, httpmock.GetCallCountInfo()["POST =~/nodes/pve/storage/local/upload$"], "exact artifact reuse must not dispatch an upload")
