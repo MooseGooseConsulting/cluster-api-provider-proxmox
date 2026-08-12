@@ -179,19 +179,9 @@ func (c *APIClient) CloudInit(ctx context.Context, vm *proxmox.VirtualMachine, m
 		return nil
 	}
 
-	selection, err := findCloudInitUploadTarget(ctx, node, machineIdentity, isoName, size)
-	if err != nil {
-		return fmt.Errorf("find exact cloud-init ISO upload target on node %q: %w", vm.Node, err)
-	}
-	uploadAddress, err := c.resolveCloudInitUploadAddress(ctx, vm.Node)
+	selection, expectedVolID, err := c.selectCloudInitUploadTarget(ctx, node, vm, machineIdentity, device, isoName, size)
 	if err != nil {
 		return err
-	}
-	expectedVolID := fmt.Sprintf("%s:iso/%s", selection.storage.Name, isoName)
-	if selection.supersededStorage != nil {
-		if err := c.reconcileSupersededCloudInitArtifact(ctx, vm, machineIdentity, device, expectedVolID, selection.supersededStorage, selection.supersededVolID); err != nil {
-			return err
-		}
 	}
 	storage := selection.storage
 
@@ -209,7 +199,19 @@ func (c *APIClient) CloudInit(ctx context.Context, vm *proxmox.VirtualMachine, m
 	if intentAlreadyRecorded {
 		uploadState.DispatchOwner = current.DispatchOwner
 		uploadState.LeaseUntilUnix = current.LeaseUntilUnix
-	} else {
+	}
+	if selection.exactArtifactPresent {
+		uploadState.Phase = capmox.CloudInitUploadPhaseComplete
+		if err := recordCloudInitUpload(recorder, uploadState, "record reused cloud-init upload completion"); err != nil {
+			return err
+		}
+		return finishCloudInitMount(ctx, vm, machineIdentity, device, expectedVolID)
+	}
+	uploadAddress, err := c.resolveCloudInitUploadAddress(ctx, vm.Node)
+	if err != nil {
+		return err
+	}
+	if !intentAlreadyRecorded {
 		if err := claimCloudInitDispatch(&uploadState); err != nil {
 			return err
 		}
@@ -259,10 +261,24 @@ func (c *APIClient) CloudInit(ctx context.Context, vm *proxmox.VirtualMachine, m
 	return finishCloudInitMount(ctx, vm, machineIdentity, device, expectedVolID)
 }
 
+func (c *APIClient) selectCloudInitUploadTarget(ctx context.Context, node *proxmox.Node, vm *proxmox.VirtualMachine, machineIdentity, device, isoName string, size uint64) (*cloudInitUploadSelection, string, error) {
+	selection, err := findCloudInitUploadTarget(ctx, node, machineIdentity, isoName, size)
+	if err != nil {
+		return nil, "", fmt.Errorf("find exact cloud-init ISO upload target on node %q: %w", vm.Node, err)
+	}
+	expectedVolID := fmt.Sprintf("%s:iso/%s", selection.storage.Name, isoName)
+	if selection.supersededStorage != nil {
+		if err := c.reconcileSupersededCloudInitArtifact(ctx, vm, machineIdentity, device, expectedVolID, selection.supersededStorage, selection.supersededVolID); err != nil {
+			return nil, "", err
+		}
+	}
+	return selection, expectedVolID, nil
+}
+
 func (c *APIClient) resolveCloudInitUploadAddress(ctx context.Context, nodeName string) (netip.Addr, error) {
 	cluster := (&proxmox.Cluster{}).New(c.Client)
 	if err := cluster.Status(ctx); err != nil {
-		return netip.Addr{}, fmt.Errorf("%w: discover cloud-init upload node %q from cluster status: %v", capmox.ErrCloudInitUploadPending, nodeName, err)
+		return netip.Addr{}, fmt.Errorf("%w: discover cloud-init upload node %q from cluster status: %w", capmox.ErrCloudInitUploadPending, nodeName, err)
 	}
 	var match *proxmox.NodeStatus
 	for _, node := range cluster.Nodes {
@@ -277,7 +293,7 @@ func (c *APIClient) resolveCloudInitUploadAddress(ctx context.Context, nodeName 
 	if match == nil {
 		return netip.Addr{}, fmt.Errorf("%w: cluster status has no exact match for cloud-init upload node %q", capmox.ErrCloudInitUploadPending, nodeName)
 	}
-	if match.Online != 1 || match.Status != "online" {
+	if match.Online != 1 {
 		return netip.Addr{}, fmt.Errorf("%w: cloud-init upload node %q is not online in cluster status", capmox.ErrCloudInitUploadPending, nodeName)
 	}
 	address, err := netip.ParseAddr(match.IP)
@@ -584,9 +600,10 @@ func mountCloudInitISO(ctx context.Context, vm *proxmox.VirtualMachine, machineI
 }
 
 type cloudInitUploadSelection struct {
-	storage           *proxmox.Storage
-	supersededStorage *proxmox.Storage
-	supersededVolID   string
+	storage              *proxmox.Storage
+	supersededStorage    *proxmox.Storage
+	supersededVolID      string
+	exactArtifactPresent bool
 }
 
 func findCloudInitUploadTarget(ctx context.Context, node *proxmox.Node, machineIdentity, isoName string, size uint64) (*cloudInitUploadSelection, error) {
@@ -654,7 +671,7 @@ func findCloudInitUploadTarget(ctx context.Context, node *proxmox.Node, machineI
 		}
 	}
 	if matched != nil {
-		return &cloudInitUploadSelection{storage: matched, supersededStorage: supersededStorage, supersededVolID: supersededVolID}, nil
+		return &cloudInitUploadSelection{storage: matched, supersededStorage: supersededStorage, supersededVolID: supersededVolID, exactArtifactPresent: true}, nil
 	}
 	if eligible == nil {
 		return nil, fmt.Errorf("%w: no enabled ISO storage has %d bytes available", capmox.ErrCloudInitStorageDiscoveryRetryable, size)

@@ -242,6 +242,18 @@ func TestResolveCloudInitUploadAddressTreatsStatusFailureAsPending(t *testing.T)
 	require.ErrorContains(t, err, "discover cloud-init upload node")
 }
 
+func TestResolveCloudInitUploadAddressPreservesCancellationIdentity(t *testing.T) {
+	client := newTestClient(t)
+	httpmock.RegisterResponder(http.MethodGet, `=~/cluster/status$`, func(request *http.Request) (*http.Response, error) {
+		return nil, request.Context().Err()
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := client.resolveCloudInitUploadAddress(ctx, "pve-n5")
+	require.ErrorIs(t, err, capmox.ErrCloudInitUploadPending)
+	require.ErrorIs(t, err, context.Canceled)
+}
+
 type closeTrackingReader struct {
 	io.Reader
 	closed bool
