@@ -1111,7 +1111,7 @@ func TestDeleteVMIntentWaitsForImgcopyThenAllowsAbsentVMFinalization(t *testing.
 	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/test/storage$`,
 		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": &proxmox.Storages{
 			{Name: "local", Content: "iso", Enabled: 1},
-			{Name: "vmdata", Content: "iso", Enabled: 1},
+			{Name: "vmdata", Content: "images", Enabled: 1},
 		}}))
 	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/test/storage/local/content$`,
 		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": []*proxmox.StorageContent{}}))
@@ -1133,7 +1133,7 @@ func TestDeleteVMIntentWaitsForImgcopyThenAllowsAbsentVMFinalization(t *testing.
 	_, err = client.DeleteVM(context.Background(), "test", 320, "machine-uid", upload)
 	require.ErrorIs(t, err, ErrVMIDFree, "quiescent intent with exact artifact absence may release VM ownership")
 	require.Zero(t, httpmock.GetCallCountInfo()["GET =~/nodes/test/storage/vmdata/content$"],
-		"a durable upload record must not fall back to broad storage recovery")
+		"recorded cleanup must not inspect an ineligible storage")
 }
 
 func TestDeleteVMReconcilesRecordedUploadOnOriginalNodeAfterMigration(t *testing.T) {

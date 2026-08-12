@@ -328,9 +328,6 @@ func (c *APIClient) DeleteVM(ctx context.Context, nodeName string, vmID int64, m
 		if err := c.reconcileRecordedCloudInitUpload(ctx, recordedNode, machineIdentity, upload); err != nil {
 			return nil, fmt.Errorf("cannot reconcile recorded cloud-init upload for absent vm id %d: %w", vmID, err)
 		}
-		if upload != nil {
-			return nil, ErrVMIDFree
-		}
 		storage, volID, cleanupErr := recoverLegacyOwnedCloudInitVolume(ctx, node, machineIdentity)
 		if cleanupErr != nil {
 			return nil, fmt.Errorf("cannot recover untagged cloud-init ISO for absent vm id %d: %w", vmID, cleanupErr)
