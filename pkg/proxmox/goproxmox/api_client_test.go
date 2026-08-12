@@ -17,9 +17,11 @@ limitations under the License.
 package goproxmox
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"testing"
@@ -69,7 +71,7 @@ func TestUploadContextTransportPropagatesCancellationToUploadRequest(t *testing.
 	result := make(chan error, 1)
 	go func() {
 		_, err := transport.withContext(ctx, func() (*proxmox.Task, error) {
-			request, requestErr := http.NewRequest(http.MethodPost, "http://pve.local.test/api2/json/nodes/pve/storage/local/upload", nil)
+			request, requestErr := http.NewRequest(http.MethodPost, "http://pve.local.test/api2/json/nodes/pve/storage/local/upload", strings.NewReader("upload"))
 			if requestErr != nil {
 				return nil, requestErr
 			}
@@ -84,6 +86,239 @@ func TestUploadContextTransportPropagatesCancellationToUploadRequest(t *testing.
 	<-requestStarted
 	cancel()
 	require.ErrorIs(t, <-result, context.Canceled)
+}
+
+type closeTrackingReader struct {
+	io.Reader
+	closed bool
+}
+
+func (r *closeTrackingReader) Close() error {
+	r.closed = true
+	return nil
+}
+
+func TestUploadContextTransportClosesRejectedBody(t *testing.T) {
+	baseCalls := 0
+	transport := &uploadContextTransport{base: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		baseCalls++
+		return nil, errors.New("base transport must not be called")
+	})}
+	body := &closeTrackingReader{Reader: strings.NewReader("upload")}
+	request, err := http.NewRequest(http.MethodPost, "http://pve.local.test/api2/json/nodes/pve/storage/local/upload", body)
+	require.NoError(t, err)
+	request.ContentLength = 0
+	response, err := transport.RoundTrip(request)
+	if response != nil {
+		require.NoError(t, response.Body.Close())
+	}
+	require.ErrorContains(t, err, "finite body")
+	require.True(t, body.closed)
+	require.Zero(t, baseCalls)
+}
+
+func TestUploadContextTransportBuffersExactRequestBody(t *testing.T) {
+	want := bytes.Repeat([]byte("cloud-init-body"), 4096)
+	transport := &uploadContextTransport{base: roundTripperFunc(func(request *http.Request) (*http.Response, error) {
+		require.Equal(t, int64(len(want)), request.ContentLength)
+		require.NotNil(t, request.GetBody)
+		got, err := io.ReadAll(request.Body)
+		require.NoError(t, err)
+		require.Equal(t, want, got)
+		replay, err := request.GetBody()
+		require.NoError(t, err)
+		defer func() { require.NoError(t, replay.Close()) }()
+		replayed, err := io.ReadAll(replay)
+		require.NoError(t, err)
+		require.Equal(t, want, replayed)
+		return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody, Header: make(http.Header)}, nil
+	})}
+	request, err := http.NewRequest(http.MethodPost, "http://pve.local.test/api2/json/nodes/pve/storage/local/upload", bytes.NewBuffer(want))
+	require.NoError(t, err)
+	response, err := transport.withContext(context.Background(), func() (*proxmox.Task, error) {
+		response, err := transport.RoundTrip(request)
+		if response != nil {
+			defer func() { require.NoError(t, response.Body.Close()) }()
+		}
+		return nil, err
+	})
+	require.NoError(t, err)
+	require.Nil(t, response)
+}
+
+func TestUploadContextTransportRejectsOversizedAndMismatchedRequestBodies(t *testing.T) {
+	tests := []struct {
+		name          string
+		body          string
+		contentLength int64
+		wantError     string
+	}{
+		{name: "oversized declaration", body: "x", contentLength: maxCloudInitUploadRequestBytes + 1, wantError: "exceeds"},
+		{name: "short body", body: "short", contentLength: int64(len("short") + 1), wantError: "does not match Content-Length"},
+		{name: "long body", body: "longer", contentLength: int64(len("longer") - 1), wantError: "does not match Content-Length"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			baseCalls := 0
+			transport := &uploadContextTransport{base: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+				baseCalls++
+				return nil, errors.New("base transport must not be called")
+			})}
+			request, err := http.NewRequest(http.MethodPost, "http://pve.local.test/api2/json/nodes/pve/storage/local/upload", strings.NewReader(test.body))
+			require.NoError(t, err)
+			request.ContentLength = test.contentLength
+			response, err := transport.RoundTrip(request)
+			if response != nil {
+				require.NoError(t, response.Body.Close())
+			}
+			require.ErrorContains(t, err, test.wantError)
+			require.Zero(t, baseCalls)
+		})
+	}
+}
+
+func TestDeleteVMCompleteMountedUploadUnmountsBeforeDeletingArtifact(t *testing.T) {
+	client := newTestClient(t)
+	digest := strings.Repeat("b", cloudInitDigestLength)
+	upload := &capmox.CloudInitUpload{
+		Version: 1,
+		Node:    "test",
+		Storage: "local",
+		VolID:   "local:iso/user-data-machine-uid-" + digest + ".iso",
+		Size:    4096,
+		Attempt: 1,
+		Phase:   capmox.CloudInitUploadPhaseComplete,
+	}
+	cloudInitTag := proxmox.MakeTag(proxmox.TagCloudInit)
+	ide0 := upload.VolID + ",media=cdrom,size=4M"
+	artifactPresent := true
+	tagPresent := true
+	events := []string{}
+	taskUPID := proxmox.UPID("UPID:test:1:2:3:qmconfig:320:root@pam:")
+	deleteUPID := proxmox.UPID("UPID:test:1:2:4:qmdestroy:320:root@pam:")
+
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/test/status$`,
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": proxmox.Node{Name: "test"}}))
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/test/storage/local/status$`,
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": proxmox.Storage{Name: "local", Content: "iso", Enabled: 1}}))
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/test/storage/local/content$`, func(*http.Request) (*http.Response, error) {
+		contents := []*proxmox.StorageContent{}
+		if artifactPresent {
+			contents = append(contents, &proxmox.StorageContent{Volid: upload.VolID, Format: "iso", Size: upload.Size})
+		}
+		return httpmock.NewJsonResponse(200, map[string]any{"data": contents})
+	})
+	httpmock.RegisterResponder(http.MethodDelete, `=~/nodes/test/storage/local/content/.+$`, func(*http.Request) (*http.Response, error) {
+		events = append(events, "storage-delete")
+		artifactPresent = false
+		return httpmock.NewJsonResponse(200, map[string]any{"data": taskUPID})
+	})
+	httpmock.RegisterResponder(http.MethodGet, `=~/cluster/status$`,
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": proxmox.NodeStatuses{{Name: "test"}}}))
+	httpmock.RegisterResponder(http.MethodGet, `=~/cluster/nextid$`,
+		httpmock.NewJsonResponderOrPanic(400, map[string]any{"data": "VM 320 already exists"}))
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/test/qemu/320/status/current$`,
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": proxmox.VirtualMachine{Node: "test", VMID: 320, Status: "stopped"}}))
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/test/qemu/320/config$`, func(*http.Request) (*http.Response, error) {
+		config := proxmox.VirtualMachineConfig{IDE0: ide0}
+		if tagPresent {
+			config.Tags = cloudInitTag
+			config.TagsSlice = []string{cloudInitTag}
+		}
+		return httpmock.NewJsonResponse(200, map[string]any{"data": config})
+	})
+	httpmock.RegisterResponder(http.MethodPost, `=~/nodes/test/qemu/320/config$`, func(*http.Request) (*http.Response, error) {
+		if ide0 != cloudInitUnmountedDeviceValue {
+			events = append(events, "unmount")
+			ide0 = cloudInitUnmountedDeviceValue
+		} else {
+			events = append(events, "tag-remove")
+			tagPresent = false
+		}
+		return httpmock.NewJsonResponse(200, map[string]any{"data": taskUPID})
+	})
+	httpmock.RegisterResponder(http.MethodDelete, `=~/nodes/test/qemu/320$`, func(*http.Request) (*http.Response, error) {
+		events = append(events, "vm-delete")
+		return httpmock.NewJsonResponse(200, map[string]any{"data": deleteUPID})
+	})
+
+	originalWait := waitForCloudInitTask
+	waitForCloudInitTask = func(context.Context, *proxmox.Task, int) error { return nil }
+	t.Cleanup(func() { waitForCloudInitTask = originalWait })
+
+	task, err := client.DeleteVM(context.Background(), "test", 320, "machine-uid", upload)
+	require.NoError(t, err)
+	require.Equal(t, deleteUPID, task.UPID)
+	require.Equal(t, []string{"unmount", "storage-delete", "tag-remove", "vm-delete"}, events)
+}
+
+func TestDeleteVMPresentCanonicalPlaceholderWithRecordedAbsentUploadSkipsBroadRecovery(t *testing.T) {
+	assertDeleteVMPresentNarrowRecordedCleanupSkipsBroadRecovery(t, strings.Join([]string{"fast", "vm-320-cloudinit,media=cdrom,size=4M"}, ":"))
+}
+
+func TestDeleteVMPresentUnmountedRecordedUploadSkipsUnavailableUnrelatedStorage(t *testing.T) {
+	assertDeleteVMPresentNarrowRecordedCleanupSkipsBroadRecovery(t, cloudInitUnmountedDeviceValue)
+}
+
+func assertDeleteVMPresentNarrowRecordedCleanupSkipsBroadRecovery(t *testing.T, device string) {
+	t.Helper()
+	client := newTestClient(t)
+	digest := strings.Repeat("a", cloudInitDigestLength)
+	upload := &capmox.CloudInitUpload{
+		Version: 1,
+		Node:    "test",
+		Storage: "local",
+		VolID:   "local:iso/user-data-machine-uid-" + digest + ".iso",
+		Size:    4096,
+		Attempt: 3,
+		Phase:   capmox.CloudInitUploadPhaseComplete,
+	}
+	cloudInitTag := proxmox.MakeTag(proxmox.TagCloudInit)
+	tagPresent := true
+	tagUPID := proxmox.UPID("UPID:test:1:2:3:qmconfig:320:root@pam:")
+	deleteUPID := proxmox.UPID("UPID:test:1:2:4:qmdestroy:320:root@pam:")
+
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/test/status$`,
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": proxmox.Node{Name: "test"}}))
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/test/storage/local/status$`,
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": proxmox.Storage{Name: "local", Content: "iso", Enabled: 1}}))
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/test/storage/local/content$`,
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": []*proxmox.StorageContent{}}))
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/test/storage$`,
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": []*proxmox.Storage{{Name: "local", Content: "iso", Enabled: 1}, {Name: "vmdata", Content: "iso", Enabled: 1}}}))
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/test/storage/vmdata/status$`,
+		httpmock.NewJsonResponderOrPanic(500, map[string]any{"errors": "unavailable unrelated storage"}))
+	httpmock.RegisterResponder(http.MethodGet, `=~/cluster/status$`,
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": proxmox.NodeStatuses{{Name: "test"}}}))
+	httpmock.RegisterResponder(http.MethodGet, `=~/cluster/nextid$`,
+		httpmock.NewJsonResponderOrPanic(400, map[string]any{"data": "VM 320 already exists"}))
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/test/qemu/320/status/current$`,
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": proxmox.VirtualMachine{Node: "test", VMID: 320, Status: "stopped"}}))
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/test/qemu/320/config$`, func(*http.Request) (*http.Response, error) {
+		config := proxmox.VirtualMachineConfig{IDE0: device}
+		if tagPresent {
+			config.Tags = cloudInitTag
+			config.TagsSlice = []string{cloudInitTag}
+		}
+		return httpmock.NewJsonResponse(200, map[string]any{"data": config})
+	})
+	httpmock.RegisterResponder(http.MethodPost, `=~/nodes/test/qemu/320/config$`, func(*http.Request) (*http.Response, error) {
+		tagPresent = false
+		return httpmock.NewJsonResponse(200, map[string]any{"data": tagUPID})
+	})
+	httpmock.RegisterResponder(http.MethodDelete, `=~/nodes/test/qemu/320$`,
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": deleteUPID}))
+
+	originalWait := waitForCloudInitTask
+	waitForCloudInitTask = func(context.Context, *proxmox.Task, int) error { return nil }
+	t.Cleanup(func() { waitForCloudInitTask = originalWait })
+
+	task, err := client.DeleteVM(context.Background(), "test", 320, "machine-uid", upload)
+	require.NoError(t, err)
+	require.Equal(t, deleteUPID, task.UPID)
+	require.False(t, tagPresent)
+	require.Equal(t, 1, httpmock.GetCallCountInfo()["GET =~/nodes/test/storage/local/content$"])
+	require.Zero(t, httpmock.GetCallCountInfo()["GET =~/nodes/test/storage$"])
 }
 
 func TestProxmoxAPIClient_GetReservableMemoryBytes(t *testing.T) {

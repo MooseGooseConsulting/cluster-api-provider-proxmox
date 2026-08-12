@@ -18,8 +18,10 @@ limitations under the License.
 package goproxmox
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"maps"
 	"net/http"
 	"net/url"
@@ -40,6 +42,8 @@ var _ capmox.Client = &APIClient{}
 
 // ErrVMIDFree is returned if the VMID is free.
 var ErrVMIDFree = errors.New("VMID is free")
+
+const maxCloudInitUploadRequestBytes int64 = 16 << 20
 
 // APIClient Proxmox API client object.
 type APIClient struct {
@@ -62,6 +66,35 @@ func (t *uploadContextTransport) RoundTrip(request *http.Request) (*http.Respons
 		t.mu.RUnlock()
 		if ctx != nil {
 			request = request.Clone(ctx)
+		}
+		if request.Body == nil {
+			return nil, errors.New("cloud-init upload request requires a finite body")
+		}
+		if request.ContentLength <= 0 {
+			_ = request.Body.Close()
+			return nil, errors.New("cloud-init upload request requires a finite body")
+		}
+		if request.ContentLength > maxCloudInitUploadRequestBytes {
+			_ = request.Body.Close()
+			return nil, fmt.Errorf("cloud-init upload request exceeds %d-byte limit", maxCloudInitUploadRequestBytes)
+		}
+		body, err := io.ReadAll(io.LimitReader(request.Body, request.ContentLength+1))
+		closeErr := request.Body.Close()
+		if err != nil {
+			return nil, fmt.Errorf("buffer cloud-init upload request: %w", err)
+		}
+		if closeErr != nil {
+			return nil, fmt.Errorf("close cloud-init upload request body: %w", closeErr)
+		}
+		if int64(len(body)) != request.ContentLength {
+			return nil, fmt.Errorf("cloud-init upload request body length %d does not match Content-Length %d", len(body), request.ContentLength)
+		}
+		if err := request.Context().Err(); err != nil {
+			return nil, err
+		}
+		request.Body = io.NopCloser(bytes.NewReader(body))
+		request.GetBody = func() (io.ReadCloser, error) {
+			return io.NopCloser(bytes.NewReader(body)), nil
 		}
 	}
 	return t.base.RoundTrip(request)
@@ -323,10 +356,8 @@ func (c *APIClient) DeleteVM(ctx context.Context, nodeName string, vmID int64, m
 			return nil, fmt.Errorf("cannot stop vm id %d: %w", vmID, err)
 		}
 	}
-	if vm.HasTag(proxmox.MakeTag(proxmox.TagCloudInit)) {
-		if err := c.UnmountCloudInitISO(ctx, vm, machineIdentity, "ide0"); err != nil {
-			return nil, fmt.Errorf("cannot clean cloud-init ISO before deleting vm id %d: %w", vmID, err)
-		}
+	if err := c.cleanupCloudInitBeforeVMDeletion(ctx, vm, recordedNode, machineIdentity, upload); err != nil {
+		return nil, fmt.Errorf("cannot clean cloud-init ISO before deleting vm id %d: %w", vmID, err)
 	}
 
 	task, err := vm.Delete(ctx)
@@ -335,6 +366,33 @@ func (c *APIClient) DeleteVM(ctx context.Context, nodeName string, vmID int64, m
 	}
 
 	return task, nil
+}
+
+func (c *APIClient) cleanupCloudInitBeforeVMDeletion(ctx context.Context, vm *proxmox.VirtualMachine, recordedNode *proxmox.Node, machineIdentity string, upload *capmox.CloudInitUpload) error {
+	if vm.HasTag(proxmox.MakeTag(proxmox.TagCloudInit)) {
+		narrowRecordedCleanup := upload != nil && upload.Phase == capmox.CloudInitUploadPhaseComplete && vm.VirtualMachineConfig != nil &&
+			(validatePVECloudInitPlaceholder(vm.VirtualMachineConfig.IDE0, vm.VMID) == nil || vm.VirtualMachineConfig.IDE0 == cloudInitUnmountedDeviceValue)
+		var cleanupErr error
+		if narrowRecordedCleanup {
+			cleanupErr = c.reconcileRecordedCloudInitUpload(ctx, recordedNode, machineIdentity, upload)
+			if cleanupErr == nil {
+				cleanupErr = removeCloudInitOwnershipTag(ctx, vm)
+			}
+		} else {
+			cleanupErr = c.UnmountCloudInitISO(ctx, vm, machineIdentity, "ide0")
+			if cleanupErr == nil && upload != nil && upload.Phase == capmox.CloudInitUploadPhaseComplete {
+				cleanupErr = c.reconcileRecordedCloudInitUpload(ctx, recordedNode, machineIdentity, upload)
+			}
+		}
+		if cleanupErr != nil {
+			return cleanupErr
+		}
+	} else if upload != nil && upload.Phase == capmox.CloudInitUploadPhaseComplete {
+		if err := c.reconcileRecordedCloudInitUpload(ctx, recordedNode, machineIdentity, upload); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (c *APIClient) reconcileRecordedCloudInitUpload(ctx context.Context, node *proxmox.Node, machineIdentity string, upload *capmox.CloudInitUpload) error {
@@ -583,6 +641,10 @@ func (c *APIClient) UnmountCloudInitISO(ctx context.Context, vm *proxmox.Virtual
 		}
 	}
 
+	return removeCloudInitOwnershipTag(ctx, vm)
+}
+
+func removeCloudInitOwnershipTag(ctx context.Context, vm *proxmox.VirtualMachine) error {
 	removeTagTask, err := vm.RemoveTag(ctx, proxmox.MakeTag(proxmox.TagCloudInit))
 	if err != nil && !proxmox.IsErrNoop(err) {
 		return err

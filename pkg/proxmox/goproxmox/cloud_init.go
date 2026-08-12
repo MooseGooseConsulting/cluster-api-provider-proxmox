@@ -22,6 +22,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -798,7 +799,11 @@ func isAmbiguousTransportError(err error) bool {
 		return true
 	}
 	var netErr net.Error
-	return errors.As(err, &netErr)
+	if errors.As(err, &netErr) {
+		return true
+	}
+	var syntaxErr *json.SyntaxError
+	return errors.As(err, &syntaxErr)
 }
 
 func requireCloudInitISO(ctx context.Context, storage cloudInitStorage, storageName, isoName string, size uint64) error {
