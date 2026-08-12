@@ -253,14 +253,14 @@ func TestDeleteVMCompleteMountedUploadUnmountsBeforeDeletingArtifact(t *testing.
 }
 
 func TestDeleteVMPresentCanonicalPlaceholderWithRecordedAbsentUploadSkipsBroadRecovery(t *testing.T) {
-	assertDeleteVMPresentNarrowRecordedCleanupSkipsBroadRecovery(t, strings.Join([]string{"fast", "vm-320-cloudinit,media=cdrom,size=4M"}, ":"))
+	assertDeleteVMPresentNarrowRecordedCleanupSkipsBroadRecovery(t, strings.Join([]string{"fast", "vm-320-cloudinit,media=cdrom,size=4M"}, ":"), capmox.CloudInitUploadPhaseAccepted)
 }
 
 func TestDeleteVMPresentUnmountedRecordedUploadSkipsUnavailableUnrelatedStorage(t *testing.T) {
-	assertDeleteVMPresentNarrowRecordedCleanupSkipsBroadRecovery(t, cloudInitUnmountedDeviceValue)
+	assertDeleteVMPresentNarrowRecordedCleanupSkipsBroadRecovery(t, cloudInitUnmountedDeviceValue, capmox.CloudInitUploadPhaseComplete)
 }
 
-func assertDeleteVMPresentNarrowRecordedCleanupSkipsBroadRecovery(t *testing.T, device string) {
+func assertDeleteVMPresentNarrowRecordedCleanupSkipsBroadRecovery(t *testing.T, device, phase string) {
 	t.Helper()
 	client := newTestClient(t)
 	digest := strings.Repeat("a", cloudInitDigestLength)
@@ -271,7 +271,10 @@ func assertDeleteVMPresentNarrowRecordedCleanupSkipsBroadRecovery(t *testing.T, 
 		VolID:   "local:iso/user-data-machine-uid-" + digest + ".iso",
 		Size:    4096,
 		Attempt: 3,
-		Phase:   capmox.CloudInitUploadPhaseComplete,
+		Phase:   phase,
+	}
+	if phase == capmox.CloudInitUploadPhaseAccepted {
+		upload.UPID = "UPID:test:1:2:3:imgcopy:320:root@pam:"
 	}
 	cloudInitTag := proxmox.MakeTag(proxmox.TagCloudInit)
 	tagPresent := true
@@ -288,6 +291,8 @@ func assertDeleteVMPresentNarrowRecordedCleanupSkipsBroadRecovery(t *testing.T, 
 		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": []*proxmox.Storage{{Name: "local", Content: "iso", Enabled: 1}, {Name: "vmdata", Content: "iso", Enabled: 1}}}))
 	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/test/storage/vmdata/status$`,
 		httpmock.NewJsonResponderOrPanic(500, map[string]any{"errors": "unavailable unrelated storage"}))
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/test/tasks/.+/status$`,
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": map[string]any{"status": "stopped", "exitstatus": "OK"}}))
 	httpmock.RegisterResponder(http.MethodGet, `=~/cluster/status$`,
 		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": proxmox.NodeStatuses{{Name: "test"}}}))
 	httpmock.RegisterResponder(http.MethodGet, `=~/cluster/nextid$`,
