@@ -169,7 +169,9 @@ func canonicalCloudInitUploadBody(contentType string, body []byte) ([]byte, stri
 			fileBody = data
 			continue
 		}
-		if !slices.Contains([]string{"content", "checksum-algorithm", "checksum"}, name) {
+		switch name {
+		case "content", "checksum-algorithm", "checksum":
+		default:
 			return nil, "", fmt.Errorf("cloud-init upload request contains unexpected field %q", name)
 		}
 		if _, exists := fields[name]; exists {
@@ -187,6 +189,7 @@ func canonicalCloudInitUploadBody(contentType string, body []byte) ([]byte, stri
 	}
 
 	var canonical bytes.Buffer
+	canonical.Grow(len(body))
 	writer := multipart.NewWriter(&canonical)
 	for _, name := range []string{"content", "checksum-algorithm", "checksum"} {
 		if err := writer.WriteField(name, fields[name]); err != nil {
