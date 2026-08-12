@@ -88,6 +88,35 @@ func TestUploadContextTransportPropagatesCancellationToUploadRequest(t *testing.
 	require.ErrorIs(t, <-result, context.Canceled)
 }
 
+type closeTrackingReader struct {
+	io.Reader
+	closed bool
+}
+
+func (r *closeTrackingReader) Close() error {
+	r.closed = true
+	return nil
+}
+
+func TestUploadContextTransportClosesRejectedBody(t *testing.T) {
+	baseCalls := 0
+	transport := &uploadContextTransport{base: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		baseCalls++
+		return nil, errors.New("base transport must not be called")
+	})}
+	body := &closeTrackingReader{Reader: strings.NewReader("upload")}
+	request, err := http.NewRequest(http.MethodPost, "http://pve.local.test/api2/json/nodes/pve/storage/local/upload", body)
+	require.NoError(t, err)
+	request.ContentLength = 0
+	response, err := transport.RoundTrip(request)
+	if response != nil {
+		require.NoError(t, response.Body.Close())
+	}
+	require.ErrorContains(t, err, "finite body")
+	require.True(t, body.closed)
+	require.Zero(t, baseCalls)
+}
+
 func TestUploadContextTransportBuffersExactRequestBody(t *testing.T) {
 	want := bytes.Repeat([]byte("cloud-init-body"), 4096)
 	transport := &uploadContextTransport{base: roundTripperFunc(func(request *http.Request) (*http.Response, error) {

@@ -67,7 +67,11 @@ func (t *uploadContextTransport) RoundTrip(request *http.Request) (*http.Respons
 		if ctx != nil {
 			request = request.Clone(ctx)
 		}
-		if request.Body == nil || request.ContentLength <= 0 {
+		if request.Body == nil {
+			return nil, errors.New("cloud-init upload request requires a finite body")
+		}
+		if request.ContentLength <= 0 {
+			_ = request.Body.Close()
 			return nil, errors.New("cloud-init upload request requires a finite body")
 		}
 		if request.ContentLength > maxCloudInitUploadRequestBytes {
