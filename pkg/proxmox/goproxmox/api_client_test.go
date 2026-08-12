@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/netip"
 	"strings"
 	"testing"
 
@@ -43,7 +44,6 @@ func newTestClient(t *testing.T) *APIClient {
 
 	httpmock.RegisterResponder(http.MethodGet, testBaseURL+"api2/json/version",
 		newJSONResponder(200, proxmox.Version{Release: "test"}))
-
 	client, err := NewAPIClient(context.Background(), logr.Discard(), testBaseURL, http.DefaultClient)
 	require.NoError(t, err)
 
@@ -54,23 +54,35 @@ func newJSONResponder(status int, data any) httpmock.Responder {
 	return httpmock.NewJsonResponderOrPanic(status, map[string]any{"data": data}).Once()
 }
 
+func registerCloudInitUploadNode(node, address string) {
+	httpmock.RegisterResponder(http.MethodGet, `=~/cluster/status$`,
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": []map[string]any{
+			{"type": "cluster", "id": "cluster", "name": "test", "version": 1, "quorate": 1},
+			{"type": "node", "id": "node/" + node, "name": node, "online": 1, "ip": address},
+		}}))
+}
+
 type roundTripperFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripperFunc) RoundTrip(request *http.Request) (*http.Response, error) {
 	return f(request)
 }
 
+func testUploadTransport(base http.RoundTripper) *uploadContextTransport {
+	return &uploadContextTransport{base: base}
+}
+
 func TestUploadContextTransportPropagatesCancellationToUploadRequest(t *testing.T) {
 	requestStarted := make(chan struct{})
-	transport := &uploadContextTransport{base: roundTripperFunc(func(request *http.Request) (*http.Response, error) {
+	transport := testUploadTransport(roundTripperFunc(func(request *http.Request) (*http.Response, error) {
 		close(requestStarted)
 		<-request.Context().Done()
 		return nil, request.Context().Err()
-	})}
+	}))
 	ctx, cancel := context.WithCancel(context.Background())
 	result := make(chan error, 1)
 	go func() {
-		_, err := transport.withContext(ctx, func() (*proxmox.Task, error) {
+		_, err := transport.withRoute(ctx, "pve", "local", netip.MustParseAddr("192.0.2.10"), func() (*proxmox.Task, error) {
 			request, requestErr := http.NewRequest(http.MethodPost, "http://pve.local.test/api2/json/nodes/pve/storage/local/upload", strings.NewReader("upload"))
 			if requestErr != nil {
 				return nil, requestErr
@@ -88,6 +100,160 @@ func TestUploadContextTransportPropagatesCancellationToUploadRequest(t *testing.
 	require.ErrorIs(t, <-result, context.Canceled)
 }
 
+func TestUploadContextTransportRoutesExactUploadToResolvedNode(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		address  string
+		wantHost string
+	}{
+		{name: "IPv4", address: "192.168.30.5", wantHost: "192.168.30.5:8006"},
+		{name: "IPv6", address: "2001:db8::5", wantHost: "[2001:db8::5]:8006"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			baseCalls := 0
+			transport := testUploadTransport(roundTripperFunc(func(request *http.Request) (*http.Response, error) {
+				baseCalls++
+				require.Equal(t, "https", request.URL.Scheme)
+				require.Equal(t, test.wantHost, request.URL.Host)
+				require.Empty(t, request.Host)
+				require.Equal(t, cloudInitUploadRequestPath("pve-n5", "fast"), request.URL.EscapedPath())
+				return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody, Header: make(http.Header)}, nil
+			}))
+			_, err := transport.withRoute(context.Background(), "pve-n5", "fast", netip.MustParseAddr(test.address), func() (*proxmox.Task, error) {
+				request, requestErr := http.NewRequest(http.MethodPost, "https://cluster.example:8006/api2/json/nodes/pve-n5/storage/fast/upload", strings.NewReader("upload"))
+				require.NoError(t, requestErr)
+				request.Host = "cluster.example:8006"
+				response, requestErr := transport.RoundTrip(request)
+				if response != nil {
+					require.NoError(t, response.Body.Close())
+				}
+				return nil, requestErr
+			})
+			require.NoError(t, err)
+			require.Equal(t, 1, baseCalls)
+		})
+	}
+}
+
+func TestUploadContextTransportLeavesEveryNonUploadCallOnClusterEndpoint(t *testing.T) {
+	tests := []struct {
+		name   string
+		method string
+		path   string
+	}{
+		{name: "upload GET", method: http.MethodGet, path: cloudInitUploadRequestPath("pve-n5", "fast")},
+		{name: "task status", method: http.MethodGet, path: "/api2/json/nodes/pve-n5/tasks/UPID/status"},
+		{name: "artifact proof", method: http.MethodGet, path: "/api2/json/nodes/pve-n5/storage/fast/content"},
+		{name: "artifact delete", method: http.MethodDelete, path: "/api2/json/nodes/pve-n5/storage/fast/content/fast%3Aiso%2Fowned.iso"},
+		{name: "mount", method: http.MethodPost, path: "/api2/json/nodes/pve-n5/qemu/320/config"},
+		{name: "unrelated upload suffix", method: http.MethodPost, path: "/api2/json/nodes/pve-n5/other/upload"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			transport := testUploadTransport(roundTripperFunc(func(request *http.Request) (*http.Response, error) {
+				require.Equal(t, "cluster.example:8006", request.URL.Host)
+				return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody, Header: make(http.Header)}, nil
+			}))
+			_, err := transport.withRoute(context.Background(), "pve-n5", "fast", netip.MustParseAddr("192.168.30.5"), func() (*proxmox.Task, error) {
+				request, requestErr := http.NewRequest(test.method, "https://cluster.example:8006"+test.path, nil)
+				require.NoError(t, requestErr)
+				response, requestErr := transport.RoundTrip(request)
+				if response != nil {
+					require.NoError(t, response.Body.Close())
+				}
+				return nil, requestErr
+			})
+			require.NoError(t, err)
+		})
+	}
+}
+
+func TestUploadContextTransportRejectsMissingOrMismatchedDirectRoute(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		configure bool
+		path      string
+		wantError string
+	}{
+		{name: "missing route", path: cloudInitUploadRequestPath("pve-n5", "fast"), wantError: "no direct-node route"},
+		{name: "wrong node", configure: true, path: cloudInitUploadRequestPath("other", "fast"), wantError: "does not match"},
+		{name: "wrong storage", configure: true, path: cloudInitUploadRequestPath("pve-n5", "other"), wantError: "does not match"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			baseCalls := 0
+			transport := testUploadTransport(roundTripperFunc(func(*http.Request) (*http.Response, error) {
+				baseCalls++
+				return nil, errors.New("base transport must not be called")
+			}))
+			if test.configure {
+				transport.route = &cloudInitUploadRoute{context: context.Background(), path: cloudInitUploadRequestPath("pve-n5", "fast"), address: netip.MustParseAddr("192.168.30.5")}
+			}
+			request, err := http.NewRequest(http.MethodPost, "https://cluster.example:8006"+test.path, strings.NewReader("upload"))
+			require.NoError(t, err)
+			response, err := transport.RoundTrip(request)
+			if response != nil {
+				require.NoError(t, response.Body.Close())
+			}
+			require.ErrorContains(t, err, test.wantError)
+			require.Zero(t, baseCalls)
+		})
+	}
+}
+
+func TestResolveCloudInitUploadAddressRequiresOneExactOnlineNode(t *testing.T) {
+	tests := []struct {
+		name      string
+		nodes     []map[string]any
+		want      string
+		wantError string
+	}{
+		{name: "IPv4", nodes: []map[string]any{{"type": "node", "id": "node/pve-n5", "name": "pve-n5", "online": 1, "ip": "192.168.30.5"}}, want: "192.168.30.5"},
+		{name: "IPv6", nodes: []map[string]any{{"type": "node", "id": "node/pve-n5", "name": "pve-n5", "online": 1, "ip": "2001:db8::5"}}, want: "2001:db8::5"},
+		{name: "absent", nodes: []map[string]any{{"type": "node", "id": "node/other", "name": "other", "online": 1, "ip": "192.168.30.6"}}, wantError: "no exact match"},
+		{name: "duplicate", nodes: []map[string]any{{"type": "node", "id": "node/pve-n5", "name": "pve-n5", "online": 1, "ip": "192.168.30.5"}, {"type": "node", "id": "node/pve-n5-duplicate", "name": "pve-n5", "online": 1, "ip": "192.168.30.6"}}, wantError: "multiple exact matches"},
+		{name: "offline", nodes: []map[string]any{{"type": "node", "id": "node/pve-n5", "name": "pve-n5", "online": 0, "ip": "192.168.30.5"}}, wantError: "not online"},
+		{name: "invalid IP", nodes: []map[string]any{{"type": "node", "id": "node/pve-n5", "name": "pve-n5", "online": 1, "ip": "pve-n5.example"}}, wantError: "invalid cluster-status IP"},
+		{name: "zoned IPv6", nodes: []map[string]any{{"type": "node", "id": "node/pve-n5", "name": "pve-n5", "online": 1, "ip": "fe80::5%eth0"}}, wantError: "invalid cluster-status IP"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			client := newTestClient(t)
+			data := []map[string]any{{"type": "cluster", "id": "cluster", "name": "test", "version": 1, "quorate": 1}}
+			data = append(data, test.nodes...)
+			httpmock.RegisterResponder(http.MethodGet, testBaseURL+"api2/json/cluster/status",
+				httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": data}))
+			address, err := client.resolveCloudInitUploadAddress(context.Background(), "pve-n5")
+			if test.wantError == "" {
+				require.NoError(t, err)
+				require.Equal(t, test.want, address.String())
+				return
+			}
+			require.ErrorIs(t, err, capmox.ErrCloudInitUploadPending)
+			require.ErrorContains(t, err, test.wantError)
+		})
+	}
+}
+
+func TestResolveCloudInitUploadAddressTreatsStatusFailureAsPending(t *testing.T) {
+	client := newTestClient(t)
+	httpmock.RegisterResponder(http.MethodGet, `=~/cluster/status$`, newJSONResponder(http.StatusInternalServerError, nil))
+	_, err := client.resolveCloudInitUploadAddress(context.Background(), "pve-n5")
+	require.ErrorIs(t, err, capmox.ErrCloudInitUploadPending)
+	require.ErrorContains(t, err, "discover cloud-init upload node")
+}
+
+func TestResolveCloudInitUploadAddressPreservesCancellationIdentity(t *testing.T) {
+	client := newTestClient(t)
+	httpmock.RegisterResponder(http.MethodGet, `=~/cluster/status$`, func(request *http.Request) (*http.Response, error) {
+		return nil, request.Context().Err()
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := client.resolveCloudInitUploadAddress(ctx, "pve-n5")
+	require.ErrorIs(t, err, capmox.ErrCloudInitUploadPending)
+	require.ErrorIs(t, err, context.Canceled)
+}
+
 type closeTrackingReader struct {
 	io.Reader
 	closed bool
@@ -100,10 +266,11 @@ func (r *closeTrackingReader) Close() error {
 
 func TestUploadContextTransportClosesRejectedBody(t *testing.T) {
 	baseCalls := 0
-	transport := &uploadContextTransport{base: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+	transport := testUploadTransport(roundTripperFunc(func(*http.Request) (*http.Response, error) {
 		baseCalls++
 		return nil, errors.New("base transport must not be called")
-	})}
+	}))
+	transport.route = &cloudInitUploadRoute{context: context.Background(), path: cloudInitUploadRequestPath("pve", "local"), address: netip.MustParseAddr("192.0.2.10")}
 	body := &closeTrackingReader{Reader: strings.NewReader("upload")}
 	request, err := http.NewRequest(http.MethodPost, "http://pve.local.test/api2/json/nodes/pve/storage/local/upload", body)
 	require.NoError(t, err)
@@ -119,7 +286,7 @@ func TestUploadContextTransportClosesRejectedBody(t *testing.T) {
 
 func TestUploadContextTransportBuffersExactRequestBody(t *testing.T) {
 	want := bytes.Repeat([]byte("cloud-init-body"), 4096)
-	transport := &uploadContextTransport{base: roundTripperFunc(func(request *http.Request) (*http.Response, error) {
+	transport := testUploadTransport(roundTripperFunc(func(request *http.Request) (*http.Response, error) {
 		require.Equal(t, int64(len(want)), request.ContentLength)
 		require.NotNil(t, request.GetBody)
 		got, err := io.ReadAll(request.Body)
@@ -132,10 +299,10 @@ func TestUploadContextTransportBuffersExactRequestBody(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, want, replayed)
 		return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody, Header: make(http.Header)}, nil
-	})}
+	}))
 	request, err := http.NewRequest(http.MethodPost, "http://pve.local.test/api2/json/nodes/pve/storage/local/upload", bytes.NewBuffer(want))
 	require.NoError(t, err)
-	response, err := transport.withContext(context.Background(), func() (*proxmox.Task, error) {
+	response, err := transport.withRoute(context.Background(), "pve", "local", netip.MustParseAddr("192.0.2.10"), func() (*proxmox.Task, error) {
 		response, err := transport.RoundTrip(request)
 		if response != nil {
 			defer func() { require.NoError(t, response.Body.Close()) }()
@@ -160,10 +327,11 @@ func TestUploadContextTransportRejectsOversizedAndMismatchedRequestBodies(t *tes
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			baseCalls := 0
-			transport := &uploadContextTransport{base: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+			transport := testUploadTransport(roundTripperFunc(func(*http.Request) (*http.Response, error) {
 				baseCalls++
 				return nil, errors.New("base transport must not be called")
-			})}
+			}))
+			transport.route = &cloudInitUploadRoute{context: context.Background(), path: cloudInitUploadRequestPath("pve", "local"), address: netip.MustParseAddr("192.0.2.10")}
 			request, err := http.NewRequest(http.MethodPost, "http://pve.local.test/api2/json/nodes/pve/storage/local/upload", strings.NewReader(test.body))
 			require.NoError(t, err)
 			request.ContentLength = test.contentLength

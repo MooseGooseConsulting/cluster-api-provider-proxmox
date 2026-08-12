@@ -867,6 +867,7 @@ func TestMakeCloudInitISOErrorRemovesTemporaryFile(t *testing.T) {
 
 func TestCloudInitRecoveredUploadTagsMountsAndPreservesBoot(t *testing.T) {
 	client := newTestClient(t)
+	registerCloudInitUploadNode("pve", "192.0.2.10")
 	vmFixture := &proxmox.VirtualMachine{
 		Node: "pve",
 		VMID: proxmox.StringOrUint64(320),
@@ -980,6 +981,71 @@ func TestCloudInitRecoveredUploadTagsMountsAndPreservesBoot(t *testing.T) {
 	require.Equal(t, "local:iso/"+uploadedName, uploadStates[2].VolID)
 	_, decodeErr := hex.DecodeString(uploadedChecksum)
 	require.NoError(t, decodeErr)
+}
+
+func TestCloudInitFinalPreflightReusesExactArtifactWithoutClusterStatus(t *testing.T) {
+	client := newTestClient(t)
+	const (
+		userdata      = "user-data"
+		metadata      = "meta-data"
+		networkConfig = "network-data"
+	)
+	isoPath, err := makeCloudInitISO(userdata, metadata, "", networkConfig)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = os.Remove(isoPath) })
+	_, size, err := fileSHA256(isoPath)
+	require.NoError(t, err)
+	isoName, err := cloudInitISOName("machine-uid", cloudInitBootstrapDigest(userdata, metadata, "", networkConfig))
+	require.NoError(t, err)
+	expectedVolID := "local:iso/" + isoName
+	cloudInitTag := proxmox.MakeTag(proxmox.TagCloudInit)
+	vmConfig := &proxmox.VirtualMachineConfig{IDE0: cloudInitUnmountedDeviceValue, Tags: cloudInitTag, TagsSlice: []string{cloudInitTag}}
+	vm := &proxmox.VirtualMachine{Node: "pve", VMID: 320, VirtualMachineConfig: vmConfig}
+	vm.New(client.Client, "pve", 320)
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve/status$`,
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": proxmox.Node{Name: "pve"}}))
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve/storage$`,
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": &proxmox.Storages{{Name: "local", Content: "iso", Enabled: 1, Avail: 1 << 30}}}))
+	contentCalls := 0
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve/storage/local/content$`, func(*http.Request) (*http.Response, error) {
+		contentCalls++
+		contents := []*proxmox.StorageContent{}
+		if contentCalls > 1 {
+			contents = append(contents, &proxmox.StorageContent{Volid: expectedVolID, Format: "iso", Size: size})
+		}
+		return httpmock.NewJsonResponse(200, map[string]any{"data": contents})
+	})
+	mountUPID := proxmox.UPID("UPID:pve:1:2:3:qmconfig:320:root@pam:")
+	mountCalls := 0
+	httpmock.RegisterResponder(http.MethodPost, `=~/nodes/pve/qemu/320/config$`, func(request *http.Request) (*http.Response, error) {
+		mountCalls++
+		config := map[string]string{}
+		require.NoError(t, json.NewDecoder(request.Body).Decode(&config))
+		vmConfig.IDE0 = config[cloudInitDevice]
+		return httpmock.NewJsonResponse(200, map[string]any{"data": mountUPID})
+	})
+	httpmock.RegisterResponder(http.MethodGet, fmt.Sprintf(`=~/nodes/pve/tasks/%s/status$`, string(mountUPID)),
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": proxmox.Task{UPID: mountUPID, Node: "pve", Status: "stopped", ExitStatus: "OK"}}))
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve/qemu/320/status/current$`,
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": proxmox.VirtualMachine{Node: "pve", VMID: 320}}))
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve/qemu/320/config$`, func(*http.Request) (*http.Response, error) {
+		return httpmock.NewJsonResponse(200, map[string]any{"data": vmConfig})
+	})
+
+	var recorded []capmox.CloudInitUpload
+	err = client.CloudInit(context.Background(), vm, "machine-uid", cloudInitDevice, userdata, metadata, "", networkConfig, nil, func(upload capmox.CloudInitUpload) error {
+		recorded = append(recorded, upload)
+		return nil
+	})
+	require.NoError(t, err)
+	require.Len(t, recorded, 2)
+	require.Equal(t, capmox.CloudInitUploadPhaseIntent, recorded[0].Phase)
+	require.Equal(t, capmox.CloudInitUploadPhaseComplete, recorded[1].Phase)
+	require.Equal(t, expectedVolID, recorded[1].VolID)
+	require.Equal(t, 2, contentCalls, "the artifact must appear only at the final pre-dispatch preflight")
+	require.Equal(t, 1, mountCalls)
+	require.Zero(t, httpmock.GetCallCountInfo()["GET =~/cluster/status$"], "exact artifact reuse must not require direct-node discovery")
+	require.Zero(t, httpmock.GetCallCountInfo()["POST =~/nodes/pve/storage/local/upload$"], "exact artifact reuse must not dispatch an upload")
 }
 
 func TestCloudInitResumesAcceptedUploadWithoutRedispatch(t *testing.T) {
@@ -1139,6 +1205,7 @@ func TestCloudInitCancellationDefersRecoveryAndMountToSuccessor(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			client := newTestClient(t)
+			registerCloudInitUploadNode("pve", "192.0.2.10")
 			const (
 				userdata      = "user-data"
 				metadata      = "meta-data"
@@ -1231,6 +1298,7 @@ func TestCloudInitCancellationDefersRecoveryAndMountToSuccessor(t *testing.T) {
 
 func TestCloudInitRearmsQuiescentIntentAndDispatchesExactlyOnce(t *testing.T) {
 	client := newTestClient(t)
+	registerCloudInitUploadNode("pve", "192.0.2.10")
 	const (
 		userdata      = "user-data"
 		metadata      = "meta-data"
@@ -1256,8 +1324,6 @@ func TestCloudInitRearmsQuiescentIntentAndDispatchesExactlyOnce(t *testing.T) {
 	vm.New(client.Client, "pve", 320)
 	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve/status$`,
 		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": proxmox.Node{Name: "pve"}}))
-	httpmock.RegisterResponder(http.MethodGet, `=~/cluster/status$`,
-		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": proxmox.NodeStatuses{{Name: "pve"}}}))
 	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve/storage/local/status$`,
 		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": proxmox.Storage{Name: "local", Content: "iso", Enabled: 1, Avail: 1 << 30}}))
 	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve/storage$`,
@@ -1516,6 +1582,7 @@ func TestCloudInitRequiresCurrentOwnershipImmediatelyBeforePOST(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			client := newTestClient(t)
+			registerCloudInitUploadNode("pve", "192.0.2.10")
 			const (
 				userdata      = "user-data"
 				metadata      = "meta-data"
@@ -1673,6 +1740,7 @@ func TestFindCloudInitUploadTargetReusesExactArtifactAcrossStorageOrderDrift(t *
 	selection, err := findCloudInitUploadTarget(context.Background(), node, "machine-uid", isoName, 4096)
 	require.NoError(t, err)
 	require.Equal(t, "original", selection.storage.Name, "retry must reuse the existing exact artifact rather than the new first eligible storage")
+	require.True(t, selection.exactArtifactPresent)
 }
 
 func TestFindCloudInitUploadTargetBoundsDiscoveryAndSelectsCapacityDeterministically(t *testing.T) {
@@ -1700,6 +1768,7 @@ func TestFindCloudInitUploadTargetBoundsDiscoveryAndSelectsCapacityDeterministic
 	selection, err := findCloudInitUploadTarget(context.Background(), node, "machine-uid", isoName, 4096)
 	require.NoError(t, err)
 	require.Equal(t, "alpha", selection.storage.Name, "selection must skip full storage and be stable across API order")
+	require.False(t, selection.exactArtifactPresent)
 	require.Zero(t, httpmock.GetCallCountInfo()["GET =~/nodes/pve/storage/disabled/content$"])
 	require.Zero(t, httpmock.GetCallCountInfo()["GET =~/nodes/pve/storage/backup/content$"])
 }
