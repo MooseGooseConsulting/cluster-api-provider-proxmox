@@ -22,6 +22,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
+	"mime/multipart"
 	"net/http"
 	"net/netip"
 	"strings"
@@ -72,6 +74,28 @@ func testUploadTransport(base http.RoundTripper) *uploadContextTransport {
 	return &uploadContextTransport{base: base}
 }
 
+func testMultipartUploadRequest(t *testing.T, target string, fileBody []byte) *http.Request {
+	t.Helper()
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	for _, field := range []struct{ name, value string }{
+		{name: "checksum", value: strings.Repeat("a", 64)},
+		{name: "content", value: "iso"},
+		{name: "checksum-algorithm", value: "sha256"},
+	} {
+		require.NoError(t, writer.WriteField(field.name, field.value))
+	}
+	part, err := writer.CreateFormFile("filename", "cloud-init.iso")
+	require.NoError(t, err)
+	_, err = part.Write(fileBody)
+	require.NoError(t, err)
+	require.NoError(t, writer.Close())
+	request, err := http.NewRequest(http.MethodPost, target, bytes.NewReader(body.Bytes()))
+	require.NoError(t, err)
+	request.Header.Set("Content-Type", writer.FormDataContentType())
+	return request
+}
+
 func TestUploadContextTransportPropagatesCancellationToUploadRequest(t *testing.T) {
 	requestStarted := make(chan struct{})
 	transport := testUploadTransport(roundTripperFunc(func(request *http.Request) (*http.Response, error) {
@@ -83,10 +107,7 @@ func TestUploadContextTransportPropagatesCancellationToUploadRequest(t *testing.
 	result := make(chan error, 1)
 	go func() {
 		_, err := transport.withRoute(ctx, "pve", "local", netip.MustParseAddr("192.0.2.10"), func() (*proxmox.Task, error) {
-			request, requestErr := http.NewRequest(http.MethodPost, "http://pve.local.test/api2/json/nodes/pve/storage/local/upload", strings.NewReader("upload"))
-			if requestErr != nil {
-				return nil, requestErr
-			}
+			request := testMultipartUploadRequest(t, "http://pve.local.test/api2/json/nodes/pve/storage/local/upload", []byte("upload"))
 			response, requestErr := transport.RoundTrip(request)
 			if response != nil {
 				_ = response.Body.Close()
@@ -120,8 +141,7 @@ func TestUploadContextTransportRoutesExactUploadToResolvedNode(t *testing.T) {
 				return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody, Header: make(http.Header)}, nil
 			}))
 			_, err := transport.withRoute(context.Background(), "pve-n5", "fast", netip.MustParseAddr(test.address), func() (*proxmox.Task, error) {
-				request, requestErr := http.NewRequest(http.MethodPost, "https://cluster.example:8006/api2/json/nodes/pve-n5/storage/fast/upload", strings.NewReader("upload"))
-				require.NoError(t, requestErr)
+				request := testMultipartUploadRequest(t, "https://cluster.example:8006/api2/json/nodes/pve-n5/storage/fast/upload", []byte("upload"))
 				request.Host = "cluster.example:8006"
 				response, requestErr := transport.RoundTrip(request)
 				if response != nil {
@@ -284,24 +304,58 @@ func TestUploadContextTransportClosesRejectedBody(t *testing.T) {
 	require.Zero(t, baseCalls)
 }
 
-func TestUploadContextTransportBuffersExactRequestBody(t *testing.T) {
+func TestUploadContextTransportCanonicalizesMultipartBodyForDirectNode(t *testing.T) {
 	want := bytes.Repeat([]byte("cloud-init-body"), 4096)
+	partOrder := []string{}
+	baseCalls := 0
 	transport := testUploadTransport(roundTripperFunc(func(request *http.Request) (*http.Response, error) {
-		require.Equal(t, int64(len(want)), request.ContentLength)
-		require.NotNil(t, request.GetBody)
-		got, err := io.ReadAll(request.Body)
+		baseCalls++
+		raw, err := io.ReadAll(request.Body)
 		require.NoError(t, err)
-		require.Equal(t, want, got)
+		require.Equal(t, int64(len(raw)), request.ContentLength)
+		require.Empty(t, request.TransferEncoding)
+		require.Empty(t, request.Trailer)
+		require.Equal(t, "192.0.2.10:8006", request.URL.Host)
+		require.Equal(t, cloudInitUploadRequestPath("pve", "local"), request.URL.EscapedPath())
+		require.NotNil(t, request.GetBody)
+		mediaType, params, err := mime.ParseMediaType(request.Header.Get("Content-Type"))
+		require.NoError(t, err)
+		require.Equal(t, "multipart/form-data", mediaType)
+		reader := multipart.NewReader(bytes.NewReader(raw), params["boundary"])
+		fields := map[string]string{}
+		var filename string
+		var gotFile []byte
+		for {
+			part, partErr := reader.NextPart()
+			if partErr == io.EOF {
+				break
+			}
+			require.NoError(t, partErr)
+			partOrder = append(partOrder, part.FormName())
+			data, readErr := io.ReadAll(part)
+			require.NoError(t, readErr)
+			if part.FileName() != "" {
+				filename = part.FileName()
+				gotFile = data
+			} else {
+				fields[part.FormName()] = string(data)
+			}
+		}
+		require.Equal(t, []string{"content", "checksum-algorithm", "checksum", "filename"}, partOrder)
+		require.Equal(t, map[string]string{"content": "iso", "checksum-algorithm": "sha256", "checksum": strings.Repeat("a", 64)}, fields)
+		require.Equal(t, "cloud-init.iso", filename)
+		require.Equal(t, want, gotFile)
 		replay, err := request.GetBody()
 		require.NoError(t, err)
 		defer func() { require.NoError(t, replay.Close()) }()
 		replayed, err := io.ReadAll(replay)
 		require.NoError(t, err)
-		require.Equal(t, want, replayed)
+		require.Equal(t, raw, replayed)
 		return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody, Header: make(http.Header)}, nil
 	}))
-	request, err := http.NewRequest(http.MethodPost, "http://pve.local.test/api2/json/nodes/pve/storage/local/upload", bytes.NewBuffer(want))
-	require.NoError(t, err)
+	request := testMultipartUploadRequest(t, "https://cluster.example:8006/api2/json/nodes/pve/storage/local/upload", want)
+	request.TransferEncoding = []string{"chunked"}
+	request.Trailer = http.Header{"X-Upload-Trailer": []string{"stale"}}
 	response, err := transport.withRoute(context.Background(), "pve", "local", netip.MustParseAddr("192.0.2.10"), func() (*proxmox.Task, error) {
 		response, err := transport.RoundTrip(request)
 		if response != nil {
@@ -311,6 +365,7 @@ func TestUploadContextTransportBuffersExactRequestBody(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.Nil(t, response)
+	require.Equal(t, 1, baseCalls)
 }
 
 func TestUploadContextTransportRejectsOversizedAndMismatchedRequestBodies(t *testing.T) {

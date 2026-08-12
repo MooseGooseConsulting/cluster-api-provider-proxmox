@@ -23,6 +23,8 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"mime"
+	"mime/multipart"
 	"net"
 	"net/http"
 	"net/netip"
@@ -110,6 +112,14 @@ func (t *uploadContextTransport) RoundTrip(request *http.Request) (*http.Respons
 		if err := request.Context().Err(); err != nil {
 			return nil, err
 		}
+		body, contentType, err := canonicalCloudInitUploadBody(request.Header.Get("Content-Type"), body)
+		if err != nil {
+			return nil, err
+		}
+		request.Header.Set("Content-Type", contentType)
+		request.ContentLength = int64(len(body))
+		request.TransferEncoding = nil
+		request.Trailer = nil
 		request.Body = io.NopCloser(bytes.NewReader(body))
 		request.GetBody = func() (io.ReadCloser, error) {
 			return io.NopCloser(bytes.NewReader(body)), nil
@@ -126,6 +136,74 @@ func (t *uploadContextTransport) RoundTrip(request *http.Request) (*http.Respons
 		request.Host = ""
 	}
 	return t.base.RoundTrip(request)
+}
+
+func canonicalCloudInitUploadBody(contentType string, body []byte) ([]byte, string, error) {
+	mediaType, params, err := mime.ParseMediaType(contentType)
+	if err != nil || mediaType != "multipart/form-data" || params["boundary"] == "" {
+		return nil, "", fmt.Errorf("cloud-init upload request has invalid multipart Content-Type %q", contentType)
+	}
+
+	fields := map[string]string{}
+	var filename string
+	var fileBody []byte
+	reader := multipart.NewReader(bytes.NewReader(body), params["boundary"])
+	for {
+		part, partErr := reader.NextPart()
+		if partErr == io.EOF {
+			break
+		}
+		if partErr != nil {
+			return nil, "", fmt.Errorf("parse cloud-init upload multipart body: %w", partErr)
+		}
+		data, readErr := io.ReadAll(part)
+		if readErr != nil {
+			return nil, "", fmt.Errorf("read cloud-init upload multipart part: %w", readErr)
+		}
+		name := part.FormName()
+		if part.FileName() != "" {
+			if name != "filename" || filename != "" {
+				return nil, "", errors.New("cloud-init upload request requires exactly one filename part")
+			}
+			filename = part.FileName()
+			fileBody = data
+			continue
+		}
+		if !slices.Contains([]string{"content", "checksum-algorithm", "checksum"}, name) {
+			return nil, "", fmt.Errorf("cloud-init upload request contains unexpected field %q", name)
+		}
+		if _, exists := fields[name]; exists {
+			return nil, "", fmt.Errorf("cloud-init upload request contains duplicate field %q", name)
+		}
+		fields[name] = string(data)
+	}
+	for _, name := range []string{"content", "checksum-algorithm", "checksum"} {
+		if fields[name] == "" {
+			return nil, "", fmt.Errorf("cloud-init upload request requires field %q", name)
+		}
+	}
+	if filename == "" || len(fileBody) == 0 {
+		return nil, "", errors.New("cloud-init upload request requires a non-empty filename part")
+	}
+
+	var canonical bytes.Buffer
+	writer := multipart.NewWriter(&canonical)
+	for _, name := range []string{"content", "checksum-algorithm", "checksum"} {
+		if err := writer.WriteField(name, fields[name]); err != nil {
+			return nil, "", fmt.Errorf("write cloud-init upload field %q: %w", name, err)
+		}
+	}
+	filePart, err := writer.CreateFormFile("filename", filename)
+	if err != nil {
+		return nil, "", fmt.Errorf("write cloud-init upload filename part: %w", err)
+	}
+	if _, err := filePart.Write(fileBody); err != nil {
+		return nil, "", fmt.Errorf("write cloud-init upload file body: %w", err)
+	}
+	if err := writer.Close(); err != nil {
+		return nil, "", fmt.Errorf("close canonical cloud-init upload body: %w", err)
+	}
+	return canonical.Bytes(), writer.FormDataContentType(), nil
 }
 
 func isProxmoxStorageUploadRequest(request *http.Request) bool {
