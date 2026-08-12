@@ -253,6 +253,15 @@ func TestDeleteVMCompleteMountedUploadUnmountsBeforeDeletingArtifact(t *testing.
 }
 
 func TestDeleteVMPresentCanonicalPlaceholderWithRecordedAbsentUploadSkipsBroadRecovery(t *testing.T) {
+	assertDeleteVMPresentNarrowRecordedCleanupSkipsBroadRecovery(t, strings.Join([]string{"fast", "vm-320-cloudinit,media=cdrom,size=4M"}, ":"))
+}
+
+func TestDeleteVMPresentUnmountedRecordedUploadSkipsUnavailableUnrelatedStorage(t *testing.T) {
+	assertDeleteVMPresentNarrowRecordedCleanupSkipsBroadRecovery(t, cloudInitUnmountedDeviceValue)
+}
+
+func assertDeleteVMPresentNarrowRecordedCleanupSkipsBroadRecovery(t *testing.T, device string) {
+	t.Helper()
 	client := newTestClient(t)
 	digest := strings.Repeat("a", cloudInitDigestLength)
 	upload := &capmox.CloudInitUpload{
@@ -265,7 +274,6 @@ func TestDeleteVMPresentCanonicalPlaceholderWithRecordedAbsentUploadSkipsBroadRe
 		Phase:   capmox.CloudInitUploadPhaseComplete,
 	}
 	cloudInitTag := proxmox.MakeTag(proxmox.TagCloudInit)
-	placeholder := strings.Join([]string{"fast", "vm-320-cloudinit,media=cdrom,size=4M"}, ":")
 	tagPresent := true
 	tagUPID := proxmox.UPID("UPID:test:1:2:3:qmconfig:320:root@pam:")
 	deleteUPID := proxmox.UPID("UPID:test:1:2:4:qmdestroy:320:root@pam:")
@@ -276,6 +284,10 @@ func TestDeleteVMPresentCanonicalPlaceholderWithRecordedAbsentUploadSkipsBroadRe
 		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": proxmox.Storage{Name: "local", Content: "iso", Enabled: 1}}))
 	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/test/storage/local/content$`,
 		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": []*proxmox.StorageContent{}}))
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/test/storage$`,
+		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": []*proxmox.Storage{{Name: "local", Content: "iso", Enabled: 1}, {Name: "vmdata", Content: "iso", Enabled: 1}}}))
+	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/test/storage/vmdata/status$`,
+		httpmock.NewJsonResponderOrPanic(500, map[string]any{"errors": "unavailable unrelated storage"}))
 	httpmock.RegisterResponder(http.MethodGet, `=~/cluster/status$`,
 		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": proxmox.NodeStatuses{{Name: "test"}}}))
 	httpmock.RegisterResponder(http.MethodGet, `=~/cluster/nextid$`,
@@ -283,7 +295,7 @@ func TestDeleteVMPresentCanonicalPlaceholderWithRecordedAbsentUploadSkipsBroadRe
 	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/test/qemu/320/status/current$`,
 		httpmock.NewJsonResponderOrPanic(200, map[string]any{"data": proxmox.VirtualMachine{Node: "test", VMID: 320, Status: "stopped"}}))
 	httpmock.RegisterResponder(http.MethodGet, `=~/nodes/test/qemu/320/config$`, func(*http.Request) (*http.Response, error) {
-		config := proxmox.VirtualMachineConfig{IDE0: placeholder}
+		config := proxmox.VirtualMachineConfig{IDE0: device}
 		if tagPresent {
 			config.Tags = cloudInitTag
 			config.TagsSlice = []string{cloudInitTag}

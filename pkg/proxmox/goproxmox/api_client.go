@@ -370,12 +370,11 @@ func (c *APIClient) DeleteVM(ctx context.Context, nodeName string, vmID int64, m
 
 func (c *APIClient) cleanupCloudInitBeforeVMDeletion(ctx context.Context, vm *proxmox.VirtualMachine, recordedNode *proxmox.Node, machineIdentity string, upload *capmox.CloudInitUpload) error {
 	if vm.HasTag(proxmox.MakeTag(proxmox.TagCloudInit)) {
-		placeholderProven := upload != nil && vm.VirtualMachineConfig != nil && validatePVECloudInitPlaceholder(vm.VirtualMachineConfig.IDE0, vm.VMID) == nil
+		narrowRecordedCleanup := upload != nil && upload.Phase == capmox.CloudInitUploadPhaseComplete && vm.VirtualMachineConfig != nil &&
+			(validatePVECloudInitPlaceholder(vm.VirtualMachineConfig.IDE0, vm.VMID) == nil || vm.VirtualMachineConfig.IDE0 == cloudInitUnmountedDeviceValue)
 		var cleanupErr error
-		if placeholderProven {
-			if upload.Phase == capmox.CloudInitUploadPhaseComplete {
-				cleanupErr = c.reconcileRecordedCloudInitUpload(ctx, recordedNode, machineIdentity, upload)
-			}
+		if narrowRecordedCleanup {
+			cleanupErr = c.reconcileRecordedCloudInitUpload(ctx, recordedNode, machineIdentity, upload)
 			if cleanupErr == nil {
 				cleanupErr = removeCloudInitOwnershipTag(ctx, vm)
 			}
