@@ -21,7 +21,9 @@ import (
 	"context"
 	"slices"
 	"strings"
+	"sync"
 
+	goproxmoxlib "github.com/luthermonson/go-proxmox"
 	"github.com/pkg/errors"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -52,6 +54,29 @@ const (
 
 // ErrNoVMIDInRangeFree is returned if no free VMID is found in the specified vmIDRange.
 var ErrNoVMIDInRangeFree = errors.New("No free vmid found in vmIDRange")
+
+// ser9NodeName / ser9CloneStorage: SER9 local-zfs is 479 GiB; the 500 GiB
+// Longhorn disk must land on vmdata. Homelab YAML keeps storage: local-zfs;
+// the fork applies this override. No CRD change.
+const (
+	ser9NodeName     = "pve-ser9"
+	ser9CloneStorage = "vmdata"
+)
+
+// templateCloneMu serializes config-only migrate + same-node clone + migrate
+// back of the shared clone-source template. The manager is one replica.
+var templateCloneMu sync.Mutex
+
+// waitForMigrateTask waits for a config-only migrate. Nil task is a no-op
+// (same-node or test mocks). Overridable in tests.
+var waitForMigrateTask = func(ctx context.Context, task *goproxmoxlib.Task, attempts int) error {
+	if task == nil {
+		return nil
+	}
+	return task.WaitFor(ctx, attempts)
+}
+
+const migrateWaitAttempts = 120
 
 // ReconcileVM makes sure that the VM is in the desired state by:
 //  1. Creating the VM if it does not exist, then...
@@ -465,9 +490,10 @@ func createVM(ctx context.Context, scope *scope.MachineScope) (proxmox.VMCloneRe
 		scope.InfraCluster.ProxmoxCluster.Status.NodeLocations = new(infrav1.NodeLocations)
 	}
 
+	landingNode := options.Node
 	if len(scope.InfraCluster.ProxmoxCluster.Spec.AllowedNodes) > 0 || len(scope.ProxmoxMachine.Spec.AllowedNodes) > 0 {
 		var err error
-		options.Target, err = selectNextNode(ctx, scope)
+		landingNode, err = selectNextNode(ctx, scope)
 		if err != nil {
 			if errors.As(err, &scheduler.InsufficientMemoryError{}) {
 				conditions.Set(scope.ProxmoxMachine, metav1.Condition{
@@ -500,12 +526,30 @@ func createVM(ctx context.Context, scope *scope.MachineScope) (proxmox.VMCloneRe
 			return proxmox.VMCloneResponse{}, err
 		}
 	}
-	res, err := scope.InfraCluster.ProxmoxClient.CloneVM(ctx, int(templateID), options)
+
+	homeNode := options.Node
+	if src := scope.ProxmoxMachine.GetSourceNode(); src != "" {
+		homeNode = src
+	}
+	options.Storage = resolveCloneStorage(landingNode, options.Storage)
+
+	var res proxmox.VMCloneResponse
+	if options.Storage != "" {
+		// Node-local dest storage cannot use CloneVM Target. PVE rejects
+		// qm clone --target onto local-zfs. Config-only migrate the
+		// shared-library template, same-node clone, migrate the template home.
+		res, err = cloneOnLandingNode(ctx, scope, options, int(templateID), landingNode, homeNode)
+	} else {
+		if landingNode != "" && landingNode != options.Node {
+			options.Target = landingNode
+		}
+		res, err = scope.InfraCluster.ProxmoxClient.CloneVM(ctx, int(templateID), options)
+	}
 	if err != nil {
 		return res, err
 	}
 
-	node := options.Target
+	node := landingNode
 	if node == "" {
 		node = options.Node
 	}
@@ -520,6 +564,76 @@ func createVM(ctx context.Context, scope *scope.MachineScope) (proxmox.VMCloneRe
 	}, util.IsControlPlaneMachine(scope.Machine))
 
 	return res, scope.InfraCluster.PatchObject()
+}
+
+func resolveCloneStorage(landingNode, storage string) string {
+	if landingNode == ser9NodeName {
+		return ser9CloneStorage
+	}
+	return storage
+}
+
+func cloneOnLandingNode(ctx context.Context, scope *scope.MachineScope, options proxmox.VMCloneRequest, templateID int, landingNode, homeNode string) (proxmox.VMCloneResponse, error) {
+	templateCloneMu.Lock()
+	defer templateCloneMu.Unlock()
+
+	client := scope.InfraCluster.ProxmoxClient
+	currentNode, err := locateTemplate(ctx, client, templateID, options.Node)
+	if err != nil {
+		return proxmox.VMCloneResponse{}, err
+	}
+
+	if currentNode != landingNode {
+		if err := migrateTemplate(ctx, client, templateID, currentNode, landingNode); err != nil {
+			return proxmox.VMCloneResponse{}, err
+		}
+		currentNode = landingNode
+	}
+
+	options.Node = landingNode
+	options.Target = ""
+	res, err := client.CloneVM(ctx, templateID, options)
+	if err != nil {
+		return res, err
+	}
+
+	if homeNode != "" && currentNode != homeNode {
+		if err := migrateTemplate(ctx, client, templateID, currentNode, homeNode); err != nil {
+			// Clone already succeeded. Leaving the template off homeNode is
+			// recoverable on the next create via locateTemplate. Do not
+			// retry createVM (that would clone a second VM).
+			scope.Logger.Error(err, "failed to migrate clone-source template home after same-node clone",
+				"templateID", templateID, "from", currentNode, "home", homeNode)
+		}
+	}
+	return res, nil
+}
+
+func locateTemplate(ctx context.Context, client proxmox.Client, templateID int, hintNode string) (string, error) {
+	if hintNode != "" {
+		if _, err := client.GetVM(ctx, hintNode, int64(templateID)); err == nil {
+			return hintNode, nil
+		}
+	}
+	rsc, err := client.FindVMResource(ctx, uint64(templateID))
+	if err != nil {
+		return "", errors.Wrapf(err, "cannot locate clone-source template %d", templateID)
+	}
+	return rsc.Node, nil
+}
+
+func migrateTemplate(ctx context.Context, client proxmox.Client, templateID int, fromNode, toNode string) error {
+	if fromNode == "" || toNode == "" || fromNode == toNode {
+		return nil
+	}
+	task, err := client.MigrateVM(ctx, templateID, fromNode, toNode)
+	if err != nil {
+		return errors.Wrapf(err, "config-only migrate template %d from %s to %s", templateID, fromNode, toNode)
+	}
+	if err := waitForMigrateTask(ctx, task, migrateWaitAttempts); err != nil {
+		return errors.Wrapf(err, "wait for config-only migrate of template %d from %s to %s", templateID, fromNode, toNode)
+	}
+	return nil
 }
 
 func getVMID(ctx context.Context, scope *scope.MachineScope) (int64, error) {

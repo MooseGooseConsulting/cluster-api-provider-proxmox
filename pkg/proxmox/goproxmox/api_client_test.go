@@ -731,6 +731,39 @@ func TestProxmoxAPIClient_CloneVM(t *testing.T) {
 	}
 }
 
+func TestProxmoxAPIClient_MigrateVM(t *testing.T) {
+	t.Run("same node is a no-op", func(t *testing.T) {
+		client := newTestClient(t)
+		task, err := client.MigrateVM(context.Background(), 9100, "pve-ser10", "pve-ser10")
+		require.NoError(t, err)
+		require.Nil(t, task)
+	})
+
+	t.Run("empty target fails", func(t *testing.T) {
+		client := newTestClient(t)
+		_, err := client.MigrateVM(context.Background(), 9100, "pve-ser10", "")
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "migrate target node is empty")
+	})
+
+	t.Run("config-only migrate posts to source node", func(t *testing.T) {
+		client := newTestClient(t)
+		upid := "UPID:pve-ser10:00303F51:09D93CFE:61CCA568:qmigrate:9100:root@pam:"
+		httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve-ser10/status`,
+			newJSONResponder(200, proxmox.Node{Name: "pve-ser10"}))
+		httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve-ser10/qemu/9100/status/current`,
+			newJSONResponder(200, proxmox.VirtualMachine{Node: "pve-ser10", VMID: 9100}))
+		httpmock.RegisterResponder(http.MethodGet, `=~/nodes/pve-ser10/qemu/9100/config`,
+			newJSONResponder(200, proxmox.VirtualMachineConfig{CPU: "kvm64"}))
+		httpmock.RegisterResponder(http.MethodPost, `=~/nodes/pve-ser10/qemu/9100/migrate`,
+			newJSONResponder(200, upid))
+
+		task, err := client.MigrateVM(context.Background(), 9100, "pve-ser10", "pve-ser8")
+		require.NoError(t, err)
+		require.NotNil(t, task)
+	})
+}
+
 func TestProxmoxAPIClient_ConfigureVM(t *testing.T) {
 	tests := []struct {
 		name  string

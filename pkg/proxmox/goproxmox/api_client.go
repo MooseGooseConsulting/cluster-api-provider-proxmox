@@ -301,6 +301,46 @@ func (c *APIClient) CloneVM(ctx context.Context, templateID int, clone capmox.VM
 	return capmox.VMCloneResponse{NewID: int64(newID), Task: task}, nil
 }
 
+// MigrateVM moves VM config from fromNode to toNode without copying local
+// disks. Use this for a shared-storage template so the same-node clone API
+// can run on the landing node. PVE rejects qm clone --target onto node-local
+// storage ("can't clone to non-shared storage").
+func (c *APIClient) MigrateVM(ctx context.Context, vmID int, fromNode, toNode string) (*proxmox.Task, error) {
+	if toNode == "" {
+		return nil, fmt.Errorf("migrate target node is empty")
+	}
+	if fromNode == "" {
+		rsc, err := c.FindVMResource(ctx, uint64(vmID))
+		if err != nil {
+			return nil, fmt.Errorf("cannot locate vm %d for migrate: %w", vmID, err)
+		}
+		fromNode = rsc.Node
+	}
+	if fromNode == toNode {
+		return nil, nil
+	}
+
+	node := (&proxmox.Node{}).New(c.Client, fromNode)
+	if err := node.Status(ctx); err != nil {
+		return nil, fmt.Errorf("cannot find node with name %s: %w", fromNode, err)
+	}
+
+	vm, err := node.VirtualMachine(ctx, vmID)
+	if err != nil {
+		return nil, fmt.Errorf("unable to find vm %d on %s: %w", vmID, fromNode, err)
+	}
+
+	// Omit Online and WithLocalDisks: PVE defaults to offline config-only
+	// when every disk is already on shared storage.
+	task, err := vm.Migrate(ctx, &proxmox.VirtualMachineMigrateOptions{
+		Target: toNode,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("unable to migrate vm %d from %s to %s: %w", vmID, fromNode, toNode, err)
+	}
+	return task, nil
+}
+
 // ConfigureVM updates a VMs settings.
 func (c *APIClient) ConfigureVM(ctx context.Context, vm *proxmox.VirtualMachine, options ...capmox.VirtualMachineOption) (*proxmox.Task, error) {
 	task, err := vm.Config(ctx, options...)
