@@ -65,6 +65,11 @@ const (
 type Client interface {
 	CloneVM(ctx context.Context, templateID int, clone VMCloneRequest) (VMCloneResponse, error)
 
+	// MigrateVM moves VM config from fromNode to toNode. Shared-storage disks
+	// stay put (config-only). fromNode may be empty; the client then locates
+	// the VM cluster-wide. fromNode == toNode is a no-op.
+	MigrateVM(ctx context.Context, vmID int, fromNode, toNode string) (*proxmox.Task, error)
+
 	ConfigureVM(ctx context.Context, vm *proxmox.VirtualMachine, options ...VirtualMachineOption) (*proxmox.Task, error)
 	CloudInit(ctx context.Context, vm *proxmox.VirtualMachine, machineIdentity, device, userdata, metadata, vendordata, networkconfig string, current *CloudInitUpload, recorder CloudInitUploadRecorder) error
 

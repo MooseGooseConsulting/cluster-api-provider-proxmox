@@ -688,6 +688,67 @@ func (_c *MockClient_GetVM_Call) RunAndReturn(run func(context.Context, string, 
 	return _c
 }
 
+// MigrateVM provides a mock function with given fields: ctx, vmID, fromNode, toNode
+func (_m *MockClient) MigrateVM(ctx context.Context, vmID int, fromNode string, toNode string) (*go_proxmox.Task, error) {
+	ret := _m.Called(ctx, vmID, fromNode, toNode)
+
+	if len(ret) == 0 {
+		panic("no return value specified for MigrateVM")
+	}
+
+	var r0 *go_proxmox.Task
+	var r1 error
+	if rf, ok := ret.Get(0).(func(context.Context, int, string, string) (*go_proxmox.Task, error)); ok {
+		return rf(ctx, vmID, fromNode, toNode)
+	}
+	if rf, ok := ret.Get(0).(func(context.Context, int, string, string) *go_proxmox.Task); ok {
+		r0 = rf(ctx, vmID, fromNode, toNode)
+	} else {
+		if ret.Get(0) != nil {
+			r0 = ret.Get(0).(*go_proxmox.Task)
+		}
+	}
+
+	if rf, ok := ret.Get(1).(func(context.Context, int, string, string) error); ok {
+		r1 = rf(ctx, vmID, fromNode, toNode)
+	} else {
+		r1 = ret.Error(1)
+	}
+
+	return r0, r1
+}
+
+// MockClient_MigrateVM_Call is a *mock.Call that shadows Run/Return methods with type explicit version for method 'MigrateVM'
+type MockClient_MigrateVM_Call struct {
+	*mock.Call
+}
+
+// MigrateVM is a helper method to define mock.On call
+//   - ctx context.Context
+//   - vmID int
+//   - fromNode string
+//   - toNode string
+func (_e *MockClient_Expecter) MigrateVM(ctx interface{}, vmID interface{}, fromNode interface{}, toNode interface{}) *MockClient_MigrateVM_Call {
+	return &MockClient_MigrateVM_Call{Call: _e.mock.On("MigrateVM", ctx, vmID, fromNode, toNode)}
+}
+
+func (_c *MockClient_MigrateVM_Call) Run(run func(ctx context.Context, vmID int, fromNode string, toNode string)) *MockClient_MigrateVM_Call {
+	_c.Call.Run(func(args mock.Arguments) {
+		run(args[0].(context.Context), args[1].(int), args[2].(string), args[3].(string))
+	})
+	return _c
+}
+
+func (_c *MockClient_MigrateVM_Call) Return(_a0 *go_proxmox.Task, _a1 error) *MockClient_MigrateVM_Call {
+	_c.Call.Return(_a0, _a1)
+	return _c
+}
+
+func (_c *MockClient_MigrateVM_Call) RunAndReturn(run func(context.Context, int, string, string) (*go_proxmox.Task, error)) *MockClient_MigrateVM_Call {
+	_c.Call.Return(run)
+	return _c
+}
+
 // QemuAgentStatus provides a mock function with given fields: ctx, vm
 func (_m *MockClient) QemuAgentStatus(ctx context.Context, vm *go_proxmox.VirtualMachine) error {
 	ret := _m.Called(ctx, vm)

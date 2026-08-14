@@ -124,7 +124,7 @@ func TestEnsureVirtualMachine_CreateVM_FullOptions(t *testing.T) {
 	machineScope.ProxmoxMachine.Spec.Storage = new("storage")
 	machineScope.ProxmoxMachine.Spec.AllowedNodes = []string{"node2"}
 	expectedOptions := proxmox.VMCloneRequest{
-		Node:        "node1",
+		Node:        "node2",
 		Name:        "test",
 		Description: "test vm",
 		Format:      "raw",
@@ -132,10 +132,12 @@ func TestEnsureVirtualMachine_CreateVM_FullOptions(t *testing.T) {
 		Pool:        "pool",
 		SnapName:    "snap",
 		Storage:     "storage",
-		Target:      "node2",
 	}
 	response := proxmox.VMCloneResponse{NewID: 123, Task: newTask()}
+	proxmoxClient.EXPECT().GetVM(context.Background(), "node1", int64(123)).Return(&lutherproxmox.VirtualMachine{Node: "node1", VMID: 123}, nil).Once()
+	proxmoxClient.EXPECT().MigrateVM(context.Background(), 123, "node1", "node2").Return(nil, nil).Once()
 	proxmoxClient.EXPECT().CloneVM(context.Background(), 123, expectedOptions).Return(response, nil).Once()
+	proxmoxClient.EXPECT().MigrateVM(context.Background(), 123, "node2", "node1").Return(nil, nil).Once()
 	proxmoxClient.EXPECT().GetReservableMemoryBytes(context.Background(), "node2", int64(100)).Return(^uint64(0), nil).Once()
 
 	requeue, err := ensureVirtualMachine(context.Background(), machineScope)
@@ -167,7 +169,7 @@ func TestEnsureVirtualMachine_CreateVM_FullOptions_TemplateSelector(t *testing.T
 	machineScope.ProxmoxMachine.Spec.Storage = new("storage")
 	machineScope.ProxmoxMachine.Spec.AllowedNodes = []string{"node1", "node2"}
 	expectedOptions := proxmox.VMCloneRequest{
-		Node:        "node1",
+		Node:        "node2",
 		Name:        "test",
 		Description: "test vm",
 		Format:      "raw",
@@ -175,7 +177,6 @@ func TestEnsureVirtualMachine_CreateVM_FullOptions_TemplateSelector(t *testing.T
 		Pool:        "pool",
 		SnapName:    "snap",
 		Storage:     "storage",
-		Target:      "node2",
 	}
 
 	// ResolutionPolicy is not set on the TemplateSelector in this test, so the default
@@ -186,7 +187,10 @@ func TestEnsureVirtualMachine_CreateVM_FullOptions_TemplateSelector(t *testing.T
 		Once()
 
 	response := proxmox.VMCloneResponse{NewID: 123, Task: newTask()}
+	proxmoxClient.EXPECT().GetVM(context.Background(), "node1", int64(123)).Return(&lutherproxmox.VirtualMachine{Node: "node1", VMID: 123}, nil).Once()
+	proxmoxClient.EXPECT().MigrateVM(context.Background(), 123, "node1", "node2").Return(nil, nil).Once()
 	proxmoxClient.EXPECT().CloneVM(context.Background(), 123, expectedOptions).Return(response, nil).Once()
+	proxmoxClient.EXPECT().MigrateVM(context.Background(), 123, "node2", "node1").Return(nil, nil).Once()
 	proxmoxClient.EXPECT().GetReservableMemoryBytes(context.Background(), "node1", int64(100)).Return(0, nil).Once()
 	proxmoxClient.EXPECT().GetReservableMemoryBytes(context.Background(), "node2", int64(100)).Return(^uint64(0), nil).Once()
 
@@ -797,11 +801,13 @@ func TestReconcileVM_StateMachine(t *testing.T) {
 
 	task := newTask()
 
-	// Round 0: no VM exists yet; CloneVM creates one and requeues for the task to complete.
+	// Round 0: no VM exists yet; clone-on-node creates one and requeues for the task to complete.
 	proxmoxClient.EXPECT().GetReservableMemoryBytes(context.Background(), "node1", int64(100)).Return(0, nil).Once()
 	proxmoxClient.EXPECT().GetReservableMemoryBytes(context.Background(), "node2", int64(100)).Return(^uint64(0), nil).Once()
+	proxmoxClient.EXPECT().GetVM(context.Background(), "node1", int64(123)).Return(&lutherproxmox.VirtualMachine{Node: "node1", VMID: 123}, nil).Once()
+	proxmoxClient.EXPECT().MigrateVM(context.Background(), 123, "node1", "node2").Return(nil, nil).Once()
 	proxmoxClient.EXPECT().CloneVM(context.Background(), 123, proxmox.VMCloneRequest{
-		Node:        "node1",
+		Node:        "node2",
 		Name:        "test",
 		Description: "test vm",
 		Format:      "raw",
@@ -809,8 +815,8 @@ func TestReconcileVM_StateMachine(t *testing.T) {
 		Pool:        "pool",
 		SnapName:    "snap",
 		Storage:     "storage",
-		Target:      "node2",
 	}).Return(proxmox.VMCloneResponse{NewID: 123, Task: task}, nil).Once()
+	proxmoxClient.EXPECT().MigrateVM(context.Background(), 123, "node2", "node1").Return(nil, nil).Once()
 
 	result, err := ReconcileVM(context.Background(), machineScope)
 	require.NoError(t, err)
