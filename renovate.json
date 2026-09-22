@@ -3,5 +3,22 @@
   "extends": [
     "github>MooseGooseConsulting/renovate-config"
   ],
-  "forkProcessing": "enabled"
+  "forkProcessing": "enabled",
+  "packageRules": [
+    {
+      "matchManagers": ["gomod"],
+      "matchPackageNames": ["k8s.io/api", "k8s.io/apimachinery", "k8s.io/client-go"],
+      "groupName": "kubernetes"
+    },
+    {
+      "matchManagers": ["gomod"],
+      "matchPackageNames": ["sigs.k8s.io/cluster-api", "sigs.k8s.io/cluster-api/test"],
+      "groupName": "cluster-api"
+    },
+    {
+      "matchManagers": ["gomod"],
+      "matchPackageNames": ["github.com/onsi/ginkgo/v2", "github.com/onsi/gomega"],
+      "groupName": "onsi"
+    }
+  ]
 }
