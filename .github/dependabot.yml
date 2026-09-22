@@ -1,7 +1,9 @@
 ---
 version: 2
+# Routine version updates are owned by renovate.json; security settings are retained.
 updates:
 - package-ecosystem: "gomod"
+  open-pull-requests-limit: 0
   directory: "/"
   schedule:
     interval: "daily"
@@ -23,6 +25,7 @@ updates:
       - github.com/onsi/gomega
 
 - package-ecosystem: "github-actions"
+  open-pull-requests-limit: 0
   directory: "/"
   schedule:
     interval: "daily"
