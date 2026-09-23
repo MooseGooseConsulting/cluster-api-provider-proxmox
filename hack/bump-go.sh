@@ -29,7 +29,7 @@ if [[ -n "${DIGEST}" ]]; then validate_sha256 "${DIGEST}"; fi
 NEW_MINOR=$(echo "${NEW}" | cut -d. -f1-2)
 
 gomod_set_go "${NEW}"
-dockerfile_set_go "${NEW_MINOR}"
+dockerfile_set_go "${NEW_MINOR}" "${DIGEST}"
 golangcikal_set_go "${NEW_MINOR}"
 testworkflow_set_go_image "${NEW}" "${DIGEST}"
 

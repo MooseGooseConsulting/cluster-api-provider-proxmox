@@ -24,6 +24,13 @@ Describe 'helpers.sh — file version functions'
       When call dockerfile_get_go
       The output should equal '1.26'
     End
+
+    It 'replaces a pinned digest when the Go version changes'
+      dockerfile_set_go '1.26' >/dev/null
+      When call cat "${REPO_ROOT}/Dockerfile"
+      The output should include 'FROM golang:1.26@sha256:cafebabecafebabecafebabecafebabecafebabecafebabecafebabecafebabe'
+      The output should not include 'sha256:699337d620559a59b4a2bb298ad59611e535d2ee755a34cf2d2a98f37578dc80'
+    End
   End
 
   Describe 'golangcikal_get_go'
