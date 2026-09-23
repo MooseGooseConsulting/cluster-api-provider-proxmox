@@ -320,11 +320,25 @@ makefile_get_envtest() {
 # when a change is made, and stays silent on no-op.
 
 # dockerfile_set_go updates the Go major.minor in the Dockerfile base image.
+# When the builder line is digest-pinned, the digest is replaced too: a later
+# bump must not keep the previous tag's digest. An explicit digest is used
+# as-is; otherwise it is resolved for golang:<major.minor>.
+# Usage: dockerfile_set_go <major.minor> [<digest>]
 dockerfile_set_go() {
-    local new="$1" old
+    local new="$1" given_digest="${2:-}" old digest
     old=$(dockerfile_get_go)
     if sedi "s/^(FROM golang:)[0-9]+\.[0-9]+(.*)/\1${new}\2/" "${REPO_ROOT}/Dockerfile"; then
         echo "Dockerfile: Updated golang:${old} to golang:${new}"
+    fi
+    if grep -Eq "^FROM golang:${new}@sha256:[0-9a-f]+" "${REPO_ROOT}/Dockerfile"; then
+        if [[ -n "${given_digest}" ]]; then
+            digest="${given_digest#sha256:}"
+        else
+            digest=$(docker_resolve_digest "golang:${new}")
+        fi
+        if sedi "s/^(FROM golang:${new}@sha256:)[0-9a-f]+/\1${digest}/" "${REPO_ROOT}/Dockerfile"; then
+            echo "Dockerfile: Updated golang:${new} digest to sha256:${digest}"
+        fi
     fi
     return
 }
